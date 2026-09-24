@@ -33,6 +33,24 @@ All error responses follow one of two shapes:
 
 The `details` array is **only present on 400 and 422 responses** that originate from schema validation. Other error responses contain only `"error"`.
 
+### Field naming convention
+
+`details` (plural) is the **only** auxiliary error-context field name used
+anywhere in the API — there is no singular `detail` field. This was
+standardized in #981, which found a single outlier (a 502 handler using
+`detail` to echo a caught error's message); see the next section for why
+5xx responses don't carry that kind of context at all.
+
+### 5xx responses never echo upstream error text
+
+5xx responses (`500`, `502`, `503`) always use the standard `{ "error":
+"..." }` shape with a fixed, generic message — never the caught
+exception's `.message` or any other upstream error detail. The
+underlying error is logged server-side (via the shared `lib/logger.ts`
+logger) instead, so it's available for debugging without exposing
+internal error text, stack traces, or third-party API responses (e.g.
+DocuSign, Soroban RPC) to the client. This was made explicit in #977.
+
 ---
 
 ## HTTP Status Codes
