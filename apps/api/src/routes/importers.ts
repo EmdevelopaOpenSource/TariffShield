@@ -19,6 +19,15 @@ import {
 } from '../auth.js';
 import { requireLicenseVerified } from './surety-license.js';
 import {
+  s3KeyEncrypt,
+  s3KeyDecrypt,
+  uploadDocumentToS3,
+  generatePresignedUrl,
+  scanDocumentBuffer,
+  KYC_MAX_FILE_BYTES,
+  type VirusScanStatus,
+} from './kyc.js';
+import {
   contractClient,
   explorerTx,
   platformKeypair,
@@ -878,6 +887,100 @@ importersRouter.get('/:id/collateral-status', async (req: Request, res: Response
   });
 });
 
+// ── #992 / #994: Collateral history view with retained dispute evidence and scheduled withdrawals ─────
+importersRouter.get('/:id/collateral-history', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  // 1. Fetch on-chain collateral history (best-effort)
+  let history: Array<{ value: string; timestamp: string }> = [];
+  try {
+    const rawHistory = await contractClient.getCollateralHistory(importer.stellar_address);
+    history = rawHistory.map((e) => ({
+      value: e.value.toString(),
+      timestamp: new Date(Number(e.timestamp) * 1000).toISOString(),
+    }));
+  } catch (err) {
+    req.log?.warn?.({ err, importerId: importer.id }, 'on-chain collateral history fetch failed');
+  }
+
+  // 2. Fetch all disputes (open and resolved) along with retained evidence (#992)
+  const disputesRes = await pool.query(
+    `SELECT id, importer_id, old_required::text AS old_required, new_required::text AS new_required,
+            raise_tx_hash, status, raised_at, resolved_at, resolve_tx_hash
+     FROM collateral_disputes
+     WHERE importer_id = $1
+     ORDER BY raised_at DESC`,
+    [importer.id]
+  );
+
+  const disputeIds = disputesRes.rows.map((d) => d.id);
+  const evidenceByDispute = new Map<string, any[]>();
+  if (disputeIds.length > 0) {
+    try {
+      const evRes = await pool.query(
+        `SELECT id, dispute_id, importer_id, file_name, mime_type, file_size_bytes,
+                s3_key_encrypted, virus_scan_status, notes, created_at
+         FROM dispute_evidence
+         WHERE dispute_id = ANY($1::uuid[])
+         ORDER BY created_at ASC`,
+        [disputeIds]
+      );
+      for (const ev of evRes.rows) {
+        const list = evidenceByDispute.get(ev.dispute_id) ?? [];
+        list.push({
+          id: ev.id,
+          disputeId: ev.dispute_id,
+          importerId: ev.importer_id,
+          fileName: ev.file_name,
+          mimeType: ev.mime_type,
+          fileSizeBytes: ev.file_size_bytes,
+          virusScanStatus: ev.virus_scan_status,
+          notes: ev.notes,
+          createdAt: ev.created_at,
+          downloadUrl: ev.s3_key_encrypted
+            ? generatePresignedUrl(s3KeyDecrypt(ev.s3_key_encrypted))
+            : null,
+        });
+        evidenceByDispute.set(ev.dispute_id, list);
+      }
+    } catch {
+      // Table might not exist yet before migration
+    }
+  }
+
+  const disputes = disputesRes.rows.map((d) => ({
+    ...d,
+    evidence: evidenceByDispute.get(d.id) ?? [],
+  }));
+
+  // 3. Fetch scheduled withdrawals (#994)
+  let scheduledWithdrawals: any[] = [];
+  try {
+    const swRes = await pool.query(
+      `SELECT id, importer_id, requested_by, amount_stroops::text AS amount_stroops,
+              target_date, target_address, status, execution_result, executed_at, job_id, created_at
+       FROM scheduled_withdrawals
+       WHERE importer_id = $1
+       ORDER BY target_date ASC`,
+      [importer.id]
+    );
+    scheduledWithdrawals = swRes.rows;
+  } catch {
+    scheduledWithdrawals = [];
+  }
+
+  res.json({
+    importerId: importer.id,
+    history,
+    disputes,
+    scheduledWithdrawals,
+  });
+});
+
 // ── #1007: credit-line visibility + credit-line-aware collateral health ─────
 
 // GET /importers/:id/credit-lines — active and historical credit lines for
@@ -1340,6 +1443,202 @@ importersRouter.post('/:id/auto-top-up', async (req: Request, res: Response) => 
     },
   });
   res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
+});
+
+// ── #992: Evidence Attachments on raise_dispute Submissions ───────────────────
+
+const AttachDisputeEvidenceSchema = z
+  .object({
+    disputeId: z.string().uuid().optional(),
+    notes: z.string().max(2000).optional(),
+    fileName: z.string().max(255).optional(),
+    fileBase64: z.string().min(1).optional(),
+    mimeType: z.string().regex(/^(application\/pdf|image\/(png|jpeg))$/).optional(),
+  })
+  .refine((data) => (data.notes && data.notes.trim().length > 0) || Boolean(data.fileBase64), {
+    message: 'Either notes or fileBase64 must be provided as evidence',
+  });
+
+async function handleAttachDisputeEvidence(req: Request, res: Response): Promise<void> {
+  const user = (req as AuthedRequest).user;
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const parse = AttachDisputeEvidenceSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+    return;
+  }
+
+  const targetDisputeId = req.params.disputeId || parse.data.disputeId;
+  let disputeRow: any;
+  if (targetDisputeId) {
+    const r = await pool.query(
+      'SELECT id, importer_id, status FROM collateral_disputes WHERE id = $1 AND importer_id = $2',
+      [targetDisputeId, importer.id]
+    );
+    if (!r.rowCount) {
+      res.status(404).json({ error: 'dispute not found' });
+      return;
+    }
+    disputeRow = r.rows[0];
+  } else {
+    const r = await pool.query(
+      `SELECT id, importer_id, status FROM collateral_disputes
+       WHERE importer_id = $1 AND status = 'open'
+       ORDER BY raised_at DESC LIMIT 1`,
+      [importer.id]
+    );
+    if (!r.rowCount) {
+      res.status(404).json({ error: 'no open dispute found for importer' });
+      return;
+    }
+    disputeRow = r.rows[0];
+  }
+
+  // Attempting to attach evidence after resolve_dispute is rejected (#992 AC 5)
+  if (disputeRow.status !== 'open') {
+    res.status(409).json({ error: 'dispute is already resolved; cannot attach evidence' });
+    return;
+  }
+
+  let s3KeyEncrypted: string | null = null;
+  let virusScanStatus: VirusScanStatus = 'clean';
+  let fileSizeBytes: number | null = null;
+
+  if (parse.data.fileBase64) {
+    const fileBuffer = Buffer.from(parse.data.fileBase64, 'base64');
+    if (fileBuffer.length === 0) {
+      res.status(400).json({ error: 'file is empty' });
+      return;
+    }
+    if (fileBuffer.length > KYC_MAX_FILE_BYTES) {
+      res.status(413).json({ error: `file exceeds ${KYC_MAX_FILE_BYTES} byte limit` });
+      return;
+    }
+    const mimeType = parse.data.mimeType ?? 'application/pdf';
+    virusScanStatus = scanDocumentBuffer(fileBuffer, mimeType);
+    if (virusScanStatus === 'infected') {
+      res.status(422).json({ error: 'virus detected in uploaded document' });
+      return;
+    }
+
+    const s3Key = await uploadDocumentToS3(importer.id, 'dispute_evidence', fileBuffer, mimeType);
+    s3KeyEncrypted = s3KeyEncrypt(s3Key);
+    fileSizeBytes = fileBuffer.length;
+  }
+
+  const inserted = await pool.query(
+    `INSERT INTO dispute_evidence (dispute_id, importer_id, file_name, mime_type, file_size_bytes, s3_key_encrypted, virus_scan_status, notes)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     RETURNING id, dispute_id, importer_id, file_name, mime_type, file_size_bytes, virus_scan_status, notes, created_at`,
+    [
+      disputeRow.id,
+      importer.id,
+      parse.data.fileName ?? null,
+      parse.data.mimeType ?? null,
+      fileSizeBytes,
+      s3KeyEncrypted,
+      virusScanStatus,
+      parse.data.notes ?? null,
+    ]
+  );
+
+  const evidence = inserted.rows[0];
+
+  await logAudit(user.id, 'dispute_evidence_attached', importer.id, {
+    disputeId: disputeRow.id,
+    evidenceId: evidence.id,
+    fileName: parse.data.fileName ?? null,
+    hasNotes: Boolean(parse.data.notes),
+  });
+
+  res.status(201).json({
+    evidence: {
+      ...evidence,
+      downloadUrl: s3KeyEncrypted ? generatePresignedUrl(s3KeyDecrypt(s3KeyEncrypted)) : null,
+    },
+  });
+}
+
+// Attach evidence to open dispute (with or without disputeId in URL)
+importersRouter.post('/:id/disputes/evidence', handleAttachDisputeEvidence);
+importersRouter.post('/:id/disputes/:disputeId/evidence', handleAttachDisputeEvidence);
+
+// List evidence for an importer's dispute
+importersRouter.get('/:id/disputes/:disputeId/evidence', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+  const disputeId = req.params.disputeId;
+  const evRes = await pool.query(
+    `SELECT id, dispute_id, importer_id, file_name, mime_type, file_size_bytes,
+            s3_key_encrypted, virus_scan_status, notes, created_at
+     FROM dispute_evidence
+     WHERE dispute_id = $1 AND importer_id = $2
+     ORDER BY created_at ASC`,
+    [disputeId, importer.id]
+  );
+  const evidence = evRes.rows.map((row) => ({
+    id: row.id,
+    disputeId: row.dispute_id,
+    importerId: row.importer_id,
+    fileName: row.file_name,
+    mimeType: row.mime_type,
+    fileSizeBytes: row.file_size_bytes,
+    virusScanStatus: row.virus_scan_status,
+    notes: row.notes,
+    createdAt: row.created_at,
+    downloadUrl: row.s3_key_encrypted
+      ? generatePresignedUrl(s3KeyDecrypt(row.s3_key_encrypted))
+      : null,
+  }));
+  res.json({ evidence });
+});
+
+importersRouter.get('/:id/disputes/evidence', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+  const openDispute = await pool.query(
+    `SELECT id FROM collateral_disputes WHERE importer_id = $1 AND status = 'open' ORDER BY raised_at DESC LIMIT 1`,
+    [importer.id]
+  );
+  if (!openDispute.rowCount) {
+    res.status(404).json({ error: 'no open dispute found' });
+    return;
+  }
+  const disputeId = openDispute.rows[0].id;
+  const evRes = await pool.query(
+    `SELECT id, dispute_id, importer_id, file_name, mime_type, file_size_bytes,
+            s3_key_encrypted, virus_scan_status, notes, created_at
+     FROM dispute_evidence
+     WHERE dispute_id = $1 AND importer_id = $2
+     ORDER BY created_at ASC`,
+    [disputeId, importer.id]
+  );
+  const evidence = evRes.rows.map((row) => ({
+    id: row.id,
+    disputeId: row.dispute_id,
+    importerId: row.importer_id,
+    fileName: row.file_name,
+    mimeType: row.mime_type,
+    fileSizeBytes: row.file_size_bytes,
+    virusScanStatus: row.virus_scan_status,
+    notes: row.notes,
+    createdAt: row.created_at,
+    downloadUrl: row.s3_key_encrypted
+      ? generatePresignedUrl(s3KeyDecrypt(row.s3_key_encrypted))
+      : null,
+  }));
+  res.json({ disputeId, evidence });
 });
 
 // ── #1038: Dual Sign-Off Approval Configuration & Withdrawal Workflow ───────

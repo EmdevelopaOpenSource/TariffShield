@@ -12,6 +12,7 @@ import { platformKeypair, oracleKeypair, contractClient, explorerTx } from '../s
 import { bustHtsCache } from '../services/hts-rate-validator.js';
 import { buildDisputeRecommendation } from '../services/dispute-recommendation.js';
 import { NOTIFICATION_KINDS } from '../constants/notification-kinds.js';
+import { s3KeyDecrypt, generatePresignedUrl } from './kyc.js';
 
 export const adminRouter = Router();
 adminRouter.use(authMiddleware);
@@ -809,7 +810,88 @@ adminRouter.get(
        WHERE cd.status = 'open'
        ORDER BY cd.raised_at DESC`
     );
-    res.json({ disputes: result.rows });
+
+    // #992: Surface evidence list to surety_admin before calling resolve_dispute
+    const disputeIds = result.rows.map((d) => d.id);
+    const evidenceByDispute = new Map<string, any[]>();
+    if (disputeIds.length > 0) {
+      const evResult = await pool.query(
+        `SELECT id, dispute_id, importer_id, file_name, mime_type, file_size_bytes,
+                s3_key_encrypted, virus_scan_status, notes, created_at
+         FROM dispute_evidence
+         WHERE dispute_id = ANY($1::uuid[])
+         ORDER BY created_at ASC`,
+        [disputeIds]
+      );
+      for (const ev of evResult.rows) {
+        const list = evidenceByDispute.get(ev.dispute_id) ?? [];
+        list.push({
+          id: ev.id,
+          disputeId: ev.dispute_id,
+          importerId: ev.importer_id,
+          fileName: ev.file_name,
+          mimeType: ev.mime_type,
+          fileSizeBytes: ev.file_size_bytes,
+          virusScanStatus: ev.virus_scan_status,
+          notes: ev.notes,
+          createdAt: ev.created_at,
+          downloadUrl: ev.s3_key_encrypted
+            ? generatePresignedUrl(s3KeyDecrypt(ev.s3_key_encrypted))
+            : null,
+        });
+        evidenceByDispute.set(ev.dispute_id, list);
+      }
+    }
+
+    const disputes = result.rows.map((d) => ({
+      ...d,
+      evidence: evidenceByDispute.get(d.id) ?? [],
+    }));
+
+    res.json({ disputes });
+  }
+);
+
+// GET /disputes/:id/evidence — surety_admin views evidence for a specific dispute before resolving (#992)
+adminRouter.get(
+  '/disputes/:id/evidence',
+  requireRole('surety_admin'),
+  async (req: Request, res: Response) => {
+    const disputeId = String(req.params.id ?? '');
+    const dispute = await pool.query(
+      `SELECT cd.id, cd.importer_id, cd.status, i.legal_name, i.stellar_address
+       FROM collateral_disputes cd
+       JOIN importers i ON i.id = cd.importer_id
+       WHERE cd.id = $1`,
+      [disputeId]
+    );
+    if (!dispute.rowCount) {
+      res.status(404).json({ error: 'dispute not found' });
+      return;
+    }
+    const evidenceRes = await pool.query(
+      `SELECT id, dispute_id, importer_id, file_name, mime_type, file_size_bytes,
+              s3_key_encrypted, virus_scan_status, notes, created_at
+       FROM dispute_evidence
+       WHERE dispute_id = $1
+       ORDER BY created_at ASC`,
+      [disputeId]
+    );
+    const evidence = evidenceRes.rows.map((row) => ({
+      id: row.id,
+      disputeId: row.dispute_id,
+      importerId: row.importer_id,
+      fileName: row.file_name,
+      mimeType: row.mime_type,
+      fileSizeBytes: row.file_size_bytes,
+      virusScanStatus: row.virus_scan_status,
+      notes: row.notes,
+      createdAt: row.created_at,
+      downloadUrl: row.s3_key_encrypted
+        ? generatePresignedUrl(s3KeyDecrypt(row.s3_key_encrypted))
+        : null,
+    }));
+    res.json({ dispute: dispute.rows[0], evidence });
   }
 );
 

@@ -634,6 +634,25 @@ export async function rollback(): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_collateral_disputes_importer
       ON collateral_disputes(importer_id, raised_at DESC);
 
+    -- #992: dispute evidence attachments
+    CREATE TABLE IF NOT EXISTS dispute_evidence (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      dispute_id UUID NOT NULL REFERENCES collateral_disputes(id) ON DELETE CASCADE,
+      importer_id UUID NOT NULL REFERENCES importers(id) ON DELETE CASCADE,
+      file_name TEXT,
+      mime_type TEXT,
+      file_size_bytes INTEGER,
+      s3_key_encrypted TEXT,
+      virus_scan_status TEXT DEFAULT 'clean',
+      notes TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_dispute_evidence_dispute
+      ON dispute_evidence(dispute_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_dispute_evidence_importer
+      ON dispute_evidence(importer_id, created_at DESC);
+
     -- Oracle price feed: durable audit trail of every set_required_collateral event.
     CREATE TABLE IF NOT EXISTS oracle_price_feed (
       id                   UUID          PRIMARY KEY DEFAULT uuid_generate_v4(),
