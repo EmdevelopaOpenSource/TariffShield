@@ -194,9 +194,9 @@ export async function generateMonthlyComplianceReport(targetMonth?: Date): Promi
       );
 
       await notifySuretyAdmins(suretyId, reportMonthDate);
-      console.log(`[compliance-report] generated ${reportMonthDate} report for surety ${suretyId}`);
+      console.log(`[compliance-report] Report execution: Generated ${reportMonthDate} for surety ${suretyId}`);
     } catch (err) {
-      console.error(`[compliance-report] failed for surety ${suretyId}:`, err);
+      console.error(`[compliance-report] Report execution failed for surety ${suretyId}:`, err);
     }
   }
 }
@@ -219,16 +219,16 @@ export function startComplianceReportScheduler(): void {
   async function tick() {
     const now = new Date();
     if (now.getUTCHours() === 6 && isFirstBusinessDayOfMonth(now)) {
-      console.log('[compliance-report] triggering monthly report generation');
+      console.log('[compliance-report] Scheduler: Triggering monthly report generation');
       await generateMonthlyComplianceReport(now).catch((err) =>
-        console.error('[compliance-report] scheduler error:', err)
+        console.error('[compliance-report] Scheduler error during report generation:', err)
       );
     }
   }
 
   setInterval(() => {
-    tick().catch((err) => console.error('[compliance-report] tick error:', err));
+    tick().catch((err) => console.error('[compliance-report] Scheduler tick error:', err));
   }, CHECK_INTERVAL_MS);
 
-  console.log('[compliance-report] scheduler started');
+  console.log('[compliance-report] Scheduler started');
 }
