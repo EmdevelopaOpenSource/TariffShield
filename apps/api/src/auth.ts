@@ -56,18 +56,33 @@ export const ROLE_PERMISSIONS = {
     'DELETE /branding',
   ],
   admin: ['ALL — reserved for platform operator via direct DB or Stellar keypair operations'],
+  // #988 — importer-scoped only, and only for importers with an active
+  // (non-revoked) broker_importer_grants row for this broker. No access to
+  // any surety_admin-only route.
+  broker: [
+    'GET /importers/broker/mine',
+    'GET /importers/:id (grant-scoped)',
+    'GET /importers/:id/collateral-status (grant-scoped)',
+    'GET /importers/:id/bonds (grant-scoped)',
+  ],
 } as const;
 
 // Concurrent session limits per role (SOC 2 CC6.1)
-export const MAX_SESSIONS: Record<'importer' | 'surety_admin', number> = {
+export const MAX_SESSIONS: Record<'importer' | 'surety_admin' | 'broker', number> = {
   importer: 5,
   surety_admin: 3,
+  broker: 5,
 };
 
 export interface AuthPayload {
   id: string;
   email: string;
-  role: 'importer' | 'surety_admin';
+  // #988 — 'broker' is a delegated-access role: a broker owns no importer
+  // account itself but can be granted scoped read/action access to other
+  // users' importer accounts via broker_importer_grants (see routes/broker.ts).
+  // It deliberately never gets requireRole('surety_admin') anywhere, which is
+  // what keeps it excluded from destructive admin-only actions.
+  role: 'importer' | 'surety_admin' | 'broker';
   sessionId?: string;
 }
 

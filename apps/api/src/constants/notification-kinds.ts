@@ -20,6 +20,9 @@ export const NOTIFICATION_KINDS = {
   // #1009 — multi-step review chain outcome for the importer
   REVIEW_CHAIN_APPROVED: 'review_chain_approved',
   REVIEW_CHAIN_REJECTED: 'review_chain_rejected',
+  // #991 — support ticket thread activity
+  TICKET_REPLY: 'ticket_reply',
+  TICKET_STATUS_CHANGED: 'ticket_status_changed',
 } as const;
 
 export type NotificationKind = (typeof NOTIFICATION_KINDS)[keyof typeof NOTIFICATION_KINDS];
