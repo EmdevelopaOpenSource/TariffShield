@@ -12,7 +12,7 @@ let version = 'unknown';
 try {
   const pkg = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8'));
   version = pkg.version || 'unknown';
-} catch (e) {
+} catch () {
   /* intentionally ignored — fall back to the "unknown" version already set above */
 }
 
@@ -74,7 +74,8 @@ healthRouter.get('/db', async (_req, res) => {
     });
   } catch (_err) {
     res.status(503).json({
-      status: 'failed',
+      status: 'degraded',
+      db: 'failed',
       pool: getPoolStats(),
     });
   }
