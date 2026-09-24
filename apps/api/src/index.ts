@@ -26,6 +26,7 @@ import { startComplianceReportScheduler } from './jobs/compliance-report.js';
 import { startImporterMetricsScheduler } from './jobs/refresh-importer-metrics.js';
 import { startContractEventsPartitionScheduler } from './jobs/ensure-contract-events-partitions.js';
 import { startSlaBreachChecker } from './jobs/sla-breach-checker.js';
+import { startCreditLineMonitor } from './jobs/credit-line-monitor.js';
 import { suretyLicenseRouter } from './routes/surety-license.js';
 import { regulatoryRouter } from './routes/regulatory.js';
 import { healthRouter } from './routes/health.js';
@@ -371,6 +372,7 @@ async function start() {
   startImporterMetricsScheduler();
   startContractEventsPartitionScheduler();
   startSlaBreachChecker();
+  startCreditLineMonitor();
   startApiKeyUsagePruneScheduler();
   startOnboardingDripScheduler();
   startComplianceEscalation();
