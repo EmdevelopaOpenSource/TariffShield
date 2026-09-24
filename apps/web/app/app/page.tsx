@@ -23,6 +23,7 @@ import { HealthScore } from '@/components/HealthScore';
 import { DepositWizard } from '@/components/DepositWizard';
 import { BondTimeline } from '@/components/BondTimeline';
 import { ComplianceExpirationCalendar } from '@/components/ComplianceExpirationCalendar';
+import { KycUploadDropzone } from '@/components/KycUploadDropzone';
 import { DashboardSkeleton } from '@/components/DashboardSkeleton';
 import { Spinner } from '@/components/Spinner';
 import { ErrorBanner } from '@/components/ErrorBanner';
@@ -339,6 +340,10 @@ function ImporterDashboard() {
         <ErrorBanner error={error} className="mt-4" />
 
         <BondTimeline events={events} importerId={importer.id} userRole="importer" />
+
+        <div className="mt-8">
+          <KycUploadDropzone importerId={importer.id} />
+        </div>
 
         <div className="mt-8">
           <ComplianceExpirationCalendar importerId={importer.id} />

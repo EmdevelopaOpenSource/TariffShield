@@ -211,6 +211,17 @@ function AuditLogContent() {
               <option value="accrue_yield">accrue_yield</option>
               <option value="clawback">clawback</option>
               <option value="kyc_status_update">kyc_status_update</option>
+              <option value="kyc_document_upload">kyc_document_upload</option>
+              <option value="kyc_bulk_upload">kyc_bulk_upload</option>
+              <option value="credit_line_granted">credit_line_granted</option>
+              <option value="credit_line_revoked">credit_line_revoked</option>
+              <option value="credit_line_expired">credit_line_expired</option>
+              <option value="dispute_resolved">dispute_resolved</option>
+              <option value="approval_chain_created">approval_chain_created</option>
+              <option value="review_chain_started">review_chain_started</option>
+              <option value="review_chain_step_approved">review_chain_step_approved</option>
+              <option value="review_chain_finalized">review_chain_finalized</option>
+              <option value="review_chain_rejected">review_chain_rejected</option>
               <option value="dual_approval_configured">dual_approval_configured</option>
               <option value="sku_mappings_imported">sku_mappings_imported</option>
             </select>

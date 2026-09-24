@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
-import { pool, getStaleAccounts, refreshImporterMetricsView } from '../db.js';
+import { pool, getStaleAccounts, refreshImporterMetricsView, logAudit, createNotification } from '../db.js';
 import {
   authMiddleware,
   requireRole,
@@ -8,8 +8,10 @@ import {
   tosReacceptanceGate,
   type AuthedRequest,
 } from '../auth.js';
-import { platformKeypair, oracleKeypair, contractClient } from '../stellar.js';
+import { platformKeypair, oracleKeypair, contractClient, explorerTx } from '../stellar.js';
 import { bustHtsCache } from '../services/hts-rate-validator.js';
+import { buildDisputeRecommendation } from '../services/dispute-recommendation.js';
+import { NOTIFICATION_KINDS } from '../constants/notification-kinds.js';
 
 export const adminRouter = Router();
 adminRouter.use(authMiddleware);
@@ -630,5 +632,275 @@ adminRouter.post(
     await refreshImporterMetricsView().catch(() => undefined);
 
     res.json({ succeeded, failed: errors.length, errors });
+  }
+);
+
+// ── #1007: Importer credit-line pre-approvals ───────────────────────────────
+//
+// surety_admin grants a time-boxed credit line that temporarily covers a
+// collateral shortfall off-chain. Expiry is enforced by the hourly
+// credit-line monitor job (jobs/credit-line-monitor.ts); after expiry the
+// health check reverts to the strict requirement automatically.
+
+const GrantCreditLineSchema = z
+  .object({
+    importerId: z.string().uuid(),
+    // Stroops (integer string), matching the conventions used by deposits.
+    amount: z
+      .string()
+      .regex(/^\d+$/, 'amount must be an integer string of stroops')
+      .refine((v) => BigInt(v) > 0n, { message: 'amount must be positive' }),
+    expiresAt: z.string().datetime({ offset: true }).optional(),
+    durationHours: z.number().int().min(1).max(24 * 365).optional(),
+    reason: z.string().min(1).max(500).optional(),
+  })
+  .refine((d) => d.expiresAt || d.durationHours, {
+    message: 'either expiresAt or durationHours is required',
+  });
+
+adminRouter.post('/credit-lines', requireRole('surety_admin'), async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const parse = GrantCreditLineSchema.safeParse(req.body ?? {});
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+    return;
+  }
+  const { importerId, amount, expiresAt, durationHours, reason } = parse.data;
+
+  const importer = await pool.query(
+    'SELECT id, user_id, legal_name FROM importers WHERE id = $1 AND deleted_at IS NULL',
+    [importerId]
+  );
+  if (!importer.rowCount) {
+    res.status(404).json({ error: 'importer not found' });
+    return;
+  }
+
+  const now = Date.now();
+  let expiryMs: number;
+  if (expiresAt) {
+    expiryMs = new Date(expiresAt).getTime();
+    if (expiryMs <= now + 60_000) {
+      res.status(400).json({ error: 'expiresAt must be in the future' });
+      return;
+    }
+  } else {
+    expiryMs = now + (durationHours ?? 168) * 60 * 60 * 1000;
+  }
+
+  const inserted = await pool.query(
+    `INSERT INTO credit_lines (importer_id, granted_by, amount, reason, expires_at)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id, importer_id, granted_by, amount::text AS amount, reason, status,
+               granted_at, expires_at, revoked_at, revoked_by, notified_expiring, created_at`,
+    [importerId, user.id, amount, reason ?? null, new Date(expiryMs)]
+  );
+  const creditLine = inserted.rows[0];
+
+  await logAudit(user.id, 'credit_line_granted', creditLine.id, {
+    importerId,
+    amount,
+    expiresAt: creditLine.expires_at,
+    reason: reason ?? null,
+  });
+
+  // Tell the importer their shortfall is temporarily covered (#1007 AC).
+  const userId: string | null = importer.rows[0].user_id ?? null;
+  if (userId) {
+    await createNotification(
+      userId,
+      NOTIFICATION_KINDS.CREDIT_LINE_GRANTED,
+      `A credit line of ${amount} stroops was granted to your account until ${new Date(creditLine.expires_at).toISOString()}. Deposit collateral before it expires to keep permanent coverage.`
+    ).catch(() => undefined);
+  }
+
+  res.status(201).json({ creditLine });
+});
+
+const ListCreditLinesQuerySchema = z.object({
+  importer_id: z.string().uuid().optional(),
+  status: z.enum(['active', 'expired', 'revoked']).optional(),
+});
+
+adminRouter.get('/credit-lines', requireRole('surety_admin'), async (req: Request, res: Response) => {
+  const parse = ListCreditLinesQuerySchema.safeParse(req.query ?? {});
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid query params', details: parse.error.issues });
+    return;
+  }
+
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+  if (parse.data.importer_id) {
+    params.push(parse.data.importer_id);
+    conditions.push(`cl.importer_id = $${params.length}`);
+  }
+  if (parse.data.status) {
+    params.push(parse.data.status);
+    conditions.push(`cl.status = $${params.length}`);
+  }
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+  const result = await pool.query(
+    `SELECT cl.id, cl.importer_id, i.legal_name AS importer_legal_name, cl.granted_by,
+            cl.amount::text AS amount, cl.reason, cl.status, cl.granted_at, cl.expires_at,
+            cl.revoked_at, cl.revoked_by, cl.notified_expiring, cl.created_at
+     FROM credit_lines cl
+     JOIN importers i ON i.id = cl.importer_id
+     ${where}
+     ORDER BY cl.created_at DESC
+     LIMIT 500`,
+    params
+  );
+  res.json({ creditLines: result.rows });
+});
+
+adminRouter.post(
+  '/credit-lines/:id/revoke',
+  requireRole('surety_admin'),
+  async (req: Request, res: Response) => {
+    const user = (req as AuthedRequest).user;
+    const parse = z.object({ reason: z.string().max(500).optional() }).safeParse(req.body ?? {});
+    if (!parse.success) {
+      res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+      return;
+    }
+
+    const result = await pool.query(
+      `UPDATE credit_lines
+          SET status = 'revoked', revoked_at = now(), revoked_by = $1
+        WHERE id = $2 AND status = 'active'
+        RETURNING id, importer_id, granted_by, amount::text AS amount, reason, status,
+                  granted_at, expires_at, revoked_at, revoked_by, notified_expiring, created_at`,
+      [user.id, req.params.id]
+    );
+    if (!result.rowCount) {
+      res.status(404).json({ error: 'active credit line not found' });
+      return;
+    }
+    const creditLine = result.rows[0];
+
+    await logAudit(user.id, 'credit_line_revoked', creditLine.id, {
+      importerId: creditLine.importer_id,
+      amount: creditLine.amount,
+      reason: parse.data.reason ?? null,
+    });
+
+    res.json({ creditLine });
+  }
+);
+
+// ── #1008: Dispute resolution recommendation + admin resolution ─────────────
+//
+// GET returns an advisory suggestion only; POST performs the actual
+// resolve_dispute decision (never auto-triggered — see
+// docs/dispute-recommendation.md).
+
+adminRouter.get(
+  '/disputes',
+  requireRole('surety_admin'),
+  async (_req: Request, res: Response) => {
+    const result = await pool.query(
+      `SELECT cd.id, cd.importer_id, i.legal_name AS importer_legal_name, i.stellar_address,
+              cd.old_required::text AS old_required, cd.new_required::text AS new_required,
+              cd.raise_tx_hash, cd.status, cd.raised_at, cd.resolved_at, cd.resolve_tx_hash
+       FROM collateral_disputes cd
+       JOIN importers i ON i.id = cd.importer_id
+       WHERE cd.status = 'open'
+       ORDER BY cd.raised_at DESC`
+    );
+    res.json({ disputes: result.rows });
+  }
+);
+
+adminRouter.get(
+  '/disputes/:importerId/recommendation',
+  requireRole('surety_admin'),
+  async (req: Request, res: Response) => {
+    const importerId = String(req.params.importerId ?? '');
+    if (!z.string().uuid().safeParse(importerId).success) {
+      res.status(400).json({ error: 'invalid importer id' });
+      return;
+    }
+    const recommendation = await buildDisputeRecommendation(importerId);
+    if (!recommendation) {
+      res.status(404).json({ error: 'importer not found' });
+      return;
+    }
+    res.json({ recommendation });
+  }
+);
+
+const ResolveDisputeSchema = z.object({
+  accept: z.boolean(),
+  note: z.string().max(500).optional(),
+});
+
+adminRouter.post(
+  '/disputes/:id/resolve',
+  requireRole('surety_admin'),
+  async (req: Request, res: Response) => {
+    const user = (req as AuthedRequest).user;
+    const parse = ResolveDisputeSchema.safeParse(req.body ?? {});
+    if (!parse.success) {
+      res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+      return;
+    }
+    const { accept, note } = parse.data;
+
+    const dispute = await pool.query(
+      `SELECT cd.id, cd.importer_id, cd.status, i.stellar_address, i.legal_name
+       FROM collateral_disputes cd
+       JOIN importers i ON i.id = cd.importer_id
+       WHERE cd.id = $1`,
+      [req.params.id]
+    );
+    if (!dispute.rowCount) {
+      res.status(404).json({ error: 'dispute not found' });
+      return;
+    }
+    if (dispute.rows[0].status !== 'open') {
+      res.status(409).json({ error: 'dispute is not open' });
+      return;
+    }
+
+    // Explicit admin decision — the recommendation is never applied here.
+    const onChain = await contractClient.resolveDispute(
+      platformKeypair,
+      dispute.rows[0].stellar_address,
+      accept
+    );
+
+    const newStatus = accept ? 'resolved_accepted' : 'resolved_rejected';
+    const updated = await pool.query(
+      `UPDATE collateral_disputes
+          SET status = $1, resolved_at = now(), resolve_tx_hash = $2
+        WHERE id = $3
+        RETURNING id, importer_id, old_required::text AS old_required,
+                  new_required::text AS new_required, status, raised_at, resolved_at,
+                  resolve_tx_hash`,
+      [newStatus, onChain.txHash, req.params.id]
+    );
+
+    await pool.query(
+      `INSERT INTO contract_events (importer_id, kind, tx_hash, raw)
+       VALUES ($1, 'dispute_resolved', $2, $3)
+       ON CONFLICT DO NOTHING`,
+      [
+        dispute.rows[0].importer_id,
+        onChain.txHash,
+        JSON.stringify({ accept, resolvedBy: user.id }),
+      ]
+    );
+
+    await logAudit(user.id, 'dispute_resolved', dispute.rows[0].id, {
+      importerId: dispute.rows[0].importer_id,
+      accept,
+      txHash: onChain.txHash,
+      txUrl: explorerTx(onChain.txHash),
+      note: note ?? null,
+    });
+
+    res.json({ dispute: updated.rows[0], txUrl: explorerTx(onChain.txHash) });
   }
 );
