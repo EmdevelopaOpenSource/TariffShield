@@ -12,7 +12,7 @@ let version = 'unknown';
 try {
   const pkg = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8'));
   version = pkg.version || 'unknown';
-} catch (e) {
+} catch () {
   /* intentionally ignored — fall back to the "unknown" version already set above */
 }
 
@@ -26,21 +26,21 @@ healthRouter.get('/', async (_req, res) => {
 
   try {
     await ping();
-  } catch (err) {
+  } catch (_err) {
     checks.db = 'failed';
     hasError = true;
   }
 
   try {
     await pingRpc();
-  } catch (err) {
+  } catch (_err) {
     checks.soroban = 'failed';
     hasError = true;
   }
 
   try {
     await pingRedis();
-  } catch (err) {
+  } catch (_err) {
     checks.redis = 'failed';
     hasError = true;
   }
@@ -72,9 +72,10 @@ healthRouter.get('/db', async (_req, res) => {
       status: 'ok',
       pool: getPoolStats(),
     });
-  } catch (err) {
+  } catch (_err) {
     res.status(503).json({
-      status: 'failed',
+      status: 'degraded',
+      db: 'failed',
       pool: getPoolStats(),
     });
   }
@@ -88,7 +89,7 @@ healthRouter.get('/ready', async (_req, res) => {
   try {
     await Promise.all([ping(), pingRpc(), pingRedis()]);
     res.status(200).send('OK');
-  } catch (err) {
+  } catch (_err) {
     res.status(503).send('Service Unavailable');
   }
 });

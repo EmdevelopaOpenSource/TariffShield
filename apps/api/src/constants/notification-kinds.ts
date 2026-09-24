@@ -27,6 +27,9 @@ export const NOTIFICATION_KINDS = {
   // #994 — scheduled withdrawal notifications
   SCHEDULED_WITHDRAWAL_EXECUTED: 'scheduled_withdrawal_executed',
   SCHEDULED_WITHDRAWAL_BLOCKED: 'scheduled_withdrawal_blocked',
+  // #991 — support ticket thread activity
+  TICKET_REPLY: 'ticket_reply',
+  TICKET_STATUS_CHANGED: 'ticket_status_changed',
 } as const;
 
 export type NotificationKind = (typeof NOTIFICATION_KINDS)[keyof typeof NOTIFICATION_KINDS];

@@ -19,6 +19,7 @@ import {
   type AuthedRequest,
 } from '../auth.js';
 import { env } from '../config/env.js';
+import { logger } from '../lib/logger.js';
 
 // bondSignaturesRouter — authenticated routes (send-for-signature, status, reminder)
 export const bondSignaturesRouter = Router();
@@ -93,7 +94,13 @@ bondSignaturesRouter.post(
         suretyEmail
       );
     } catch (err: any) {
-      res.status(502).json({ error: 'envelope creation failed', detail: err.message });
+      // #977: 5xx responses across the API return a fixed error string with
+      // no upstream error detail — the underlying message is logged
+      // server-side instead of echoed to the client, matching every other
+      // 5xx handler (see health.ts, erasure.ts) and avoiding leaking
+      // internal/DocuSign error text.
+      logger.error({ err, bondId: bond.bond_id }, 'DocuSign envelope creation failed');
+      res.status(502).json({ error: 'envelope creation failed' });
       return;
     }
 

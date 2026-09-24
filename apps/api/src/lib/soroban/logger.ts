@@ -14,12 +14,8 @@ const hasDebugSorobanEnv =
     return trimmed === 'soroban:*' || trimmed === 'tariffshield:soroban' || trimmed === '*';
   });
 
-const hasLogLevelSorobanDebug =
-  process.env.LOG_LEVEL === 'debug' && process.env.SOROBAN_DEBUG === 'true';
-const hasSorobanDebugOnly = process.env.SOROBAN_DEBUG === 'true';
-
 const isEnabled =
-  isAllowedEnv && (hasDebugSorobanEnv || hasLogLevelSorobanDebug || hasSorobanDebugOnly);
+  isAllowedEnv && (hasDebugSorobanEnv || process.env.SOROBAN_DEBUG === 'true');
 
 if (isEnabled) {
   const current = process.env.DEBUG || '';

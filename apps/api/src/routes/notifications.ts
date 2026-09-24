@@ -7,6 +7,12 @@ import {
   tosReacceptanceGate,
   type AuthedRequest,
 } from '../auth.js';
+import {
+  NOTIFICATION_EVENT_TYPES,
+  NOTIFICATION_CHANNELS,
+  getPreferenceGrid,
+  setPreference,
+} from '../services/notification-preferences.js';
 
 export const notificationsRouter = Router();
 notificationsRouter.use(authMiddleware);
@@ -147,4 +153,51 @@ notificationsRouter.patch('/:id/read', async (req: Request, res: Response) => {
       createdAt: notification.created_at,
     },
   });
+});
+
+// ── #990: GET/PUT /notifications/preferences — per-event, per-channel toggles ──
+
+// GET /notifications/preferences — full grid (eventType x channel), defaulted
+// to enabled, with `locked: true` on pairs that can't be disabled (critical
+// compliance categories on the in_app channel).
+notificationsRouter.get('/preferences', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const grid = await getPreferenceGrid(user.id);
+  res.json({ preferences: grid });
+});
+
+const SetPreferenceSchema = z.object({
+  eventType: z.enum(NOTIFICATION_EVENT_TYPES),
+  channel: z.enum(NOTIFICATION_CHANNELS),
+  enabled: z.boolean(),
+});
+
+const PutPreferencesSchema = z.object({
+  preferences: z.array(SetPreferenceSchema).min(1).max(100),
+});
+
+// PUT /notifications/preferences — bulk-upsert one or more toggles.
+notificationsRouter.put('/preferences', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  const parse = PutPreferencesSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+    return;
+  }
+
+  for (const { eventType, channel, enabled } of parse.data.preferences) {
+    try {
+      await setPreference(user.id, eventType, channel, enabled);
+    } catch (err) {
+      // setPreference throws only for "disable a locked critical pair".
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'invalid preference change',
+      });
+      return;
+    }
+  }
+
+  const grid = await getPreferenceGrid(user.id);
+  res.json({ preferences: grid });
 });

@@ -873,9 +873,9 @@ export async function rollback(): Promise<void> {
     CREATE POLICY audit_log_no_update ON audit_log FOR UPDATE USING (false);
     CREATE POLICY audit_log_no_delete ON audit_log FOR DELETE USING (false);
 
-    -- #232: bonds — full bond lifecycle tracking (supersedes importers.bond_id)
-    -- NOTE: importers.bond_id is deprecated and retained for backward compatibility.
-    -- All new bond queries should use the bonds table instead.
+    -- #232: bonds — full bond lifecycle tracking (supersedes importers.bond_id).
+    -- See migrations/0004_supplementary_schema.ts for why importers.bond_id
+    -- is deprecated but retained.
     CREATE TABLE IF NOT EXISTS bonds (
       id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
       importer_id UUID NOT NULL REFERENCES importers(id) ON DELETE CASCADE,
