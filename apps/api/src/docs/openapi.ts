@@ -23,6 +23,9 @@ export const openApiSpec = {
       description: 'Importer account lifecycle and on-chain collateral operations',
     },
     { name: 'KYC', description: 'Know-Your-Customer document submission and review' },
+    { name: 'Credit Lines', description: 'Importer credit-line pre-approvals (#1007)' },
+    { name: 'Disputes', description: 'Collateral dispute recommendations and resolution (#1008)' },
+    { name: 'Approvals', description: 'Configurable multi-step surety approval chains (#1009)' },
     {
       name: 'Compliance',
       description: 'AML/OFAC flags and periodic compliance reports (surety admin)',
@@ -614,6 +617,300 @@ export const openApiSpec = {
         responses: {
           200: { description: 'Document binary' },
           404: { description: 'Document not found' },
+        },
+      },
+    },
+    '/importers/{id}/kyc/batch': {
+      post: {
+        tags: ['KYC'],
+        summary: 'Bulk drag-and-drop KYC document upload (#1006)',
+        description:
+          'Accepts up to 10 files in one request. Each file is processed individually; per-file status is success, failed or virus-scan-pending. The single-file POST /importers/{id}/kyc endpoint remains supported.',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['documents'],
+                properties: {
+                  documents: {
+                    type: 'array',
+                    maxItems: 10,
+                    items: {
+                      type: 'object',
+                      required: ['documentType', 'fileBase64', 'mimeType'],
+                      properties: {
+                        documentType: {
+                          type: 'string',
+                          enum: [
+                            'articles_of_incorporation',
+                            'ein_confirmation',
+                            'beneficial_ownership_fincen_102',
+                          ],
+                        },
+                        fileBase64: { type: 'string' },
+                        mimeType: {
+                          type: 'string',
+                          enum: ['application/pdf', 'image/png', 'image/jpeg'],
+                        },
+                        fileName: { type: 'string' },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          201: {
+            description:
+              'Per-file results: { results: [{ index, fileName, documentType, status, virusScanStatus, document?, error? }], succeeded, failed, pending }',
+          },
+          404: { description: 'Importer not found' },
+        },
+      },
+    },
+    '/admin/credit-lines': {
+      get: {
+        tags: ['Credit Lines'],
+        summary: 'List credit lines (#1007)',
+        parameters: [
+          { name: 'importer_id', in: 'query', schema: { type: 'string', format: 'uuid' } },
+          {
+            name: 'status',
+            in: 'query',
+            schema: { type: 'string', enum: ['active', 'expired', 'revoked'] },
+          },
+        ],
+        responses: {
+          200: { description: '{ creditLines: [...] }' },
+          403: { description: 'Insufficient role' },
+        },
+      },
+      post: {
+        tags: ['Credit Lines'],
+        summary: 'Grant a time-boxed credit line to an importer (#1007)',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['importerId', 'amount'],
+                properties: {
+                  importerId: { type: 'string', format: 'uuid' },
+                  amount: { type: 'string', description: 'stroops (integer string)' },
+                  expiresAt: { type: 'string', format: 'date-time' },
+                  durationHours: { type: 'integer', minimum: 1 },
+                  reason: { type: 'string' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          201: { description: '{ creditLine }' },
+          400: { description: 'invalid input' },
+          403: { description: 'Insufficient role' },
+        },
+      },
+    },
+    '/admin/credit-lines/{id}/revoke': {
+      post: {
+        tags: ['Credit Lines'],
+        summary: 'Revoke an active credit line (#1007)',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        responses: {
+          200: { description: '{ creditLine }' },
+          404: { description: 'Active credit line not found' },
+        },
+      },
+    },
+    '/importers/{id}/collateral-health': {
+      get: {
+        tags: ['Credit Lines'],
+        summary: 'Credit-line-aware collateral health check (#1007)',
+        description:
+          'Active credit lines count as temporary coverage of any shortfall; expired or revoked lines are excluded so the strict requirement applies again.',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        responses: {
+          200: { description: '{ health, strict }' },
+          404: { description: 'Importer not found' },
+        },
+      },
+    },
+    '/admin/disputes': {
+      get: {
+        tags: ['Disputes'],
+        summary: 'List open collateral disputes (#1008)',
+        responses: {
+          200: { description: '{ disputes: [...] }' },
+          403: { description: 'Insufficient role' },
+        },
+      },
+    },
+    '/admin/disputes/{importerId}/recommendation': {
+      get: {
+        tags: ['Disputes'],
+        summary: 'Advisory dispute-resolution recommendation (#1008)',
+        description:
+          'Suggests accept/reject with supporting factors. Advisory only — never resolves the dispute. See docs/dispute-recommendation.md.',
+        parameters: [
+          {
+            name: 'importerId',
+            in: 'path',
+            required: true,
+            schema: { type: 'string', format: 'uuid' },
+          },
+        ],
+        responses: {
+          200: { description: '{ recommendation }' },
+          404: { description: 'Importer not found' },
+        },
+      },
+    },
+    '/admin/disputes/{id}/resolve': {
+      post: {
+        tags: ['Disputes'],
+        summary: 'Explicitly resolve a dispute on-chain (#1008)',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['accept'],
+                properties: {
+                  accept: {
+                    type: 'boolean',
+                    description: 'true = keep new requirement; false = revert to pre-dispute',
+                  },
+                  note: { type: 'string' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: '{ dispute, txUrl }' },
+          404: { description: 'Dispute not found' },
+          409: { description: 'Dispute is not open' },
+        },
+      },
+    },
+    '/importers/admin/approval-chains': {
+      get: {
+        tags: ['Approvals'],
+        summary: 'List approval chain versions (#1009)',
+        responses: {
+          200: { description: '{ chains: [...] }' },
+          403: { description: 'Insufficient role' },
+        },
+      },
+      post: {
+        tags: ['Approvals'],
+        summary: 'Create the next version of an approval chain (#1009)',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['name', 'steps'],
+                properties: {
+                  name: { type: 'string' },
+                  steps: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      required: ['name', 'requiredRole'],
+                      properties: {
+                        name: { type: 'string' },
+                        requiredRole: {
+                          type: 'string',
+                          enum: ['underwriter', 'compliance_officer', 'surety_admin'],
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          201: { description: '{ chain }' },
+          403: { description: 'Insufficient role' },
+        },
+      },
+    },
+    '/importers/admin/{id}/review/start': {
+      post: {
+        tags: ['Approvals'],
+        summary: 'Start a multi-step review chain for an importer (#1009)',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        responses: {
+          201: { description: '{ approval }' },
+          400: { description: 'No active approval chain configured' },
+          409: { description: 'A review is already in progress' },
+        },
+      },
+    },
+    '/importers/admin/{id}/review/decision': {
+      post: {
+        tags: ['Approvals'],
+        summary: 'Record the current approval step decision (#1009)',
+        description:
+          'Each step must be approved by a different surety admin. Approval finalises only when every step approves; any rejection halts the chain and notifies the importer.',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['decision'],
+                properties: {
+                  decision: { type: 'string', enum: ['approved', 'rejected'] },
+                  note: { type: 'string' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: '{ approval, finalized, halted, importerKycStatus }' },
+          403: { description: 'Same approver cannot decide two steps' },
+          404: { description: 'No review in progress' },
+        },
+      },
+    },
+    '/importers/admin/{id}/review': {
+      get: {
+        tags: ['Approvals'],
+        summary: 'Single-query importer review + approval chain state (#244, #1009)',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        responses: {
+          200: { description: '{ review, approval }' },
+          404: { description: 'Importer not found' },
         },
       },
     },

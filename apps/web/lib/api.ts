@@ -366,6 +366,59 @@ export const api = {
     if (query?.search) params.set('search', query.search);
     return `${BASE}/admin/audit-log?${params.toString()}`;
   },
+
+  // ── Bulk KYC drag-and-drop upload (#1006) ────────────────────────────────
+  listKycDocuments: (importerId: string) =>
+    request<{ documents: KycDocument[] }>(`/importers/${importerId}/kyc`),
+  uploadKycDocuments: (
+    importerId: string,
+    documents: {
+      documentType: KycDocumentType;
+      fileBase64: string;
+      mimeType: string;
+      fileName?: string;
+    }[]
+  ) =>
+    request<KycBatchUploadResult>(`/importers/${importerId}/kyc/batch`, {
+      method: 'POST',
+      body: { documents },
+    }),
+
+  // ── Importer credit-line pre-approvals (#1007) ───────────────────────────
+  getCollateralHealth: (importerId: string) =>
+    request<{ health: CollateralHealth; strict: CollateralHealth }>(
+      `/importers/${importerId}/collateral-health`
+    ),
+  listCreditLines: (importerId?: string) => {
+    const params = new URLSearchParams();
+    if (importerId) params.set('importer_id', importerId);
+    const qs = params.toString();
+    return request<{ creditLines: CreditLine[] }>(`/admin/credit-lines${qs ? `?${qs}` : ''}`);
+  },
+  grantCreditLine: (b: {
+    importerId: string;
+    amount: string;
+    expiresAt?: string;
+    durationHours?: number;
+    reason?: string;
+  }) => request<{ creditLine: CreditLine }>('/admin/credit-lines', { method: 'POST', body: b }),
+  revokeCreditLine: (id: string, reason?: string) =>
+    request<{ creditLine: CreditLine }>(`/admin/credit-lines/${id}/revoke`, {
+      method: 'POST',
+      body: { reason },
+    }),
+
+  // ── Dispute resolution recommendations (#1008) ───────────────────────────
+  listOpenDisputes: () => request<{ disputes: CollateralDispute[] }>('/admin/disputes'),
+  getDisputeRecommendation: (importerId: string) =>
+    request<{ recommendation: DisputeRecommendation }>(
+      `/admin/disputes/${importerId}/recommendation`
+    ),
+  resolveDispute: (disputeId: string, accept: boolean, note?: string) =>
+    request<{ dispute: CollateralDispute; txUrl: string }>(
+      `/admin/disputes/${disputeId}/resolve`,
+      { method: 'POST', body: { accept, note } }
+    ),
 };
 
 export interface DualApprovalConfig {
@@ -462,6 +515,117 @@ export interface AuditLogPage {
     per_page: number;
     total_pages: number;
   };
+}
+
+// ── Bulk KYC drag-and-drop upload (#1006) ──────────────────────────────────
+export type KycDocumentType =
+  | 'articles_of_incorporation'
+  | 'ein_confirmation'
+  | 'beneficial_ownership_fincen_102';
+
+export type KycVirusScanStatus = 'pending' | 'clean' | 'infected';
+
+export interface KycDocument {
+  id: string;
+  document_type: KycDocumentType;
+  document_name?: string | null;
+  upload_timestamp: string;
+  review_status: 'pending' | 'approved' | 'rejected';
+  reviewed_at?: string | null;
+  reviewer_note?: string | null;
+  scheduled_deletion_date: string;
+  virus_scan_status?: KycVirusScanStatus;
+  deleted_at?: string | null;
+}
+
+export interface KycUploadFileResult {
+  index: number;
+  fileName: string | null;
+  documentType: KycDocumentType;
+  status: 'success' | 'failed' | 'virus-scan-pending';
+  virusScanStatus: KycVirusScanStatus | null;
+  document?: KycDocument;
+  error?: string;
+}
+
+export interface KycBatchUploadResult {
+  results: KycUploadFileResult[];
+  succeeded: number;
+  failed: number;
+  pending: number;
+}
+
+// ── Importer credit-line pre-approvals (#1007) ─────────────────────────────
+export interface CreditLine {
+  id: string;
+  importer_id: string;
+  importer_legal_name?: string;
+  granted_by: string | null;
+  amount: string;
+  reason: string | null;
+  status: 'active' | 'expired' | 'revoked';
+  granted_at: string;
+  expires_at: string;
+  revoked_at: string | null;
+  revoked_by: string | null;
+  notified_expiring: boolean;
+  created_at: string;
+}
+
+export interface CollateralHealth {
+  balance: string;
+  requiredCollateral: string;
+  shortfall: string;
+  creditLineTotal: string;
+  creditLineRemaining: string;
+  status: 'healthy' | 'covered_by_credit_line' | 'shortfall';
+  creditLines: CreditLine[];
+}
+
+// ── Dispute resolution recommendations (#1008) ─────────────────────────────
+export interface CollateralDispute {
+  id: string;
+  importer_id: string;
+  importer_legal_name?: string;
+  stellar_address?: string;
+  old_required: string;
+  new_required: string;
+  raise_tx_hash: string | null;
+  status: 'open' | 'resolved_accepted' | 'resolved_rejected';
+  raised_at: string;
+  resolved_at: string | null;
+  resolve_tx_hash: string | null;
+}
+
+export interface DisputeRecommendationFactor {
+  key: string;
+  label: string;
+  detail: string;
+  direction: 'accept' | 'reject' | 'neutral';
+  weight: number;
+}
+
+export interface DisputeRecommendation {
+  importerId: string;
+  suggestion: 'accept' | 'reject';
+  confidence: 'low' | 'medium' | 'high';
+  score: number;
+  advisoryOnly: true;
+  factors: DisputeRecommendationFactor[];
+  rationale: string;
+  inputs: {
+    collateralBalance: string;
+    requiredCollateral: string;
+    preDisputeRequired: string;
+    coverageRatio: number | null;
+    latestOracleChangePct: number | null;
+    historyEntries: number;
+    depositsLast90d: number;
+    depositAmountLast90d: string;
+    resolvedDisputes: { accepted: number; rejected: number };
+    chainDataAvailable: boolean;
+  };
+  generatedAt: string;
 }
 
 export function stroopsToXlm(stroops: string | bigint | number): string {

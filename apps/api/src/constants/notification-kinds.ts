@@ -13,7 +13,13 @@ export const NOTIFICATION_KINDS = {
   UPGRADE_CANCELLED: 'upgrade_cancelled',
   SLA_BREACH: 'sla_breach',
   ONBOARDING_DRIP: 'onboarding_drip',
-  REPORT_DELIVERY_FAILED: 'report_delivery_failed',
+  // #1007 — importer credit-line pre-approval lifecycle
+  CREDIT_LINE_GRANTED: 'credit_line_granted',
+  CREDIT_LINE_EXPIRING_SOON: 'credit_line_expiring_soon',
+  CREDIT_LINE_EXPIRED: 'credit_line_expired',
+  // #1009 — multi-step review chain outcome for the importer
+  REVIEW_CHAIN_APPROVED: 'review_chain_approved',
+  REVIEW_CHAIN_REJECTED: 'review_chain_rejected',
 } as const;
 
 export type NotificationKind = (typeof NOTIFICATION_KINDS)[keyof typeof NOTIFICATION_KINDS];

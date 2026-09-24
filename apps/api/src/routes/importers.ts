@@ -8,6 +8,7 @@ import {
   logAudit,
   refreshImporterMetricsView,
   getImporterReview,
+  createNotification,
 } from '../db.js';
 import { adminRouter } from './admin.js';
 import {
@@ -29,6 +30,11 @@ import { screenImporterEntity, screenWalletAddress } from '../services/aml-scree
 import { validateBondForm301 } from '../services/cbp-bond-validation.js';
 import { env } from '../config/env.js';
 import { enqueueTxSubmit, txSubmitQueue } from '../queue.js';
+import {
+  getActiveCreditLines,
+  evaluateCollateralHealth,
+} from '../services/credit-lines.js';
+import { NOTIFICATION_KINDS } from '../constants/notification-kinds.js';
 import {
   getCachedOnChainAccount,
   setCachedOnChainAccount,
@@ -317,10 +323,391 @@ importersRouter.get('/admin/:id/review', async (req: Request, res: Response) => 
       res.status(404).json({ error: 'not found' });
       return;
     }
-    res.json({ review });
+    // #1009 — the review endpoint now also reports the multi-step approval
+    // chain state (current step + every recorded decision) alongside the
+    // single-query document review payload.
+    const approval = await getApprovalState(importerId);
+    res.json({ review, approval });
   } catch (err: any) {
     console.error('[importers] Failed to query importer review:', err);
     res.status(500).json({ error: 'failed to retrieve importer review' });
+  }
+});
+
+// ── #1009: Configurable multi-step approval chains ─────────────────────────
+//
+// surety_admin defines ordered chains (e.g. underwriter → compliance officer)
+// with a required role per step. Instances snapshot the chain's steps so an
+// in-flight review is unaffected by later chain versions; approval only
+// finalises (importer approved) once every step has approved, and any
+// rejection halts the chain and notifies the importer. Each step must be
+// approved by a different surety admin — multi-person sign-off.
+
+interface ApprovalChainStep {
+  step_number: number;
+  name: string;
+  required_role: 'underwriter' | 'compliance_officer' | 'surety_admin';
+}
+
+const ApprovalStepSchema = z.object({
+  name: z.string().min(1).max(120),
+  requiredRole: z.enum(['underwriter', 'compliance_officer', 'surety_admin']),
+});
+
+const CreateApprovalChainSchema = z.object({
+  name: z.string().min(1).max(120),
+  steps: z.array(ApprovalStepSchema).min(1).max(10),
+});
+
+async function getApprovalState(importerId: string): Promise<{
+  instance: Record<string, unknown>;
+  steps: ApprovalChainStep[];
+  decisions: Array<Record<string, unknown>>;
+  currentStep: number;
+  status: string;
+} | null> {
+  const instanceResult = await pool.query(
+    `SELECT aci.id, aci.chain_id, aci.chain_version, aci.importer_id, aci.steps,
+            aci.current_step, aci.status, aci.started_by, aci.decided_at, aci.created_at,
+            ac.name AS chain_name
+     FROM approval_chain_instances aci
+     JOIN approval_chains ac ON ac.id = aci.chain_id
+     WHERE aci.importer_id = $1
+     ORDER BY aci.created_at DESC
+     LIMIT 1`,
+    [importerId]
+  );
+  const row = instanceResult.rows[0];
+  if (!row) return null;
+
+  const decisions = await pool.query(
+    `SELECT d.step_number, d.required_role, d.step_name, d.approver_id, u.email AS approver_email,
+            d.decision, d.note, d.decided_at
+     FROM approval_chain_decisions d
+     JOIN users u ON u.id = d.approver_id
+     WHERE d.instance_id = $1
+     ORDER BY d.step_number ASC`,
+    [row.id]
+  );
+
+  return {
+    instance: {
+      id: row.id,
+      chainId: row.chain_id,
+      chainName: row.chain_name,
+      chainVersion: row.chain_version,
+      importerId: row.importer_id,
+      startedBy: row.started_by,
+      decidedAt: row.decided_at,
+      createdAt: row.created_at,
+    },
+    steps: row.steps as ApprovalChainStep[],
+    decisions: decisions.rows,
+    currentStep: row.current_step,
+    status: row.status,
+  };
+}
+
+// GET /importers/admin/approval-chains — list every chain version (auditable).
+importersRouter.get('/admin/approval-chains', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  if (user.role !== 'surety_admin') {
+    res.status(403).json({ error: 'surety admin only' });
+    return;
+  }
+  const result = await pool.query(
+    `SELECT id, name, version, scope, steps, is_active, created_by, created_at
+     FROM approval_chains
+     ORDER BY name ASC, version DESC`
+  );
+  res.json({ chains: result.rows });
+});
+
+// POST /importers/admin/approval-chains — create the next version of a named
+// chain (versioning: same name ⇒ version + 1, prior versions deactivated).
+importersRouter.post('/admin/approval-chains', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  if (user.role !== 'surety_admin') {
+    res.status(403).json({ error: 'surety admin only' });
+    return;
+  }
+
+  const parse = CreateApprovalChainSchema.safeParse(req.body ?? {});
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+    return;
+  }
+  const { name, steps } = parse.data;
+
+  const normalizedSteps: ApprovalChainStep[] = steps.map((s, i) => ({
+    step_number: i + 1,
+    name: s.name,
+    required_role: s.requiredRole,
+  }));
+
+  try {
+    const created = await pool.query(
+      `WITH next_version AS (
+         SELECT COALESCE(MAX(version), 0) + 1 AS version FROM approval_chains WHERE name = $1
+       ), deactivated AS (
+         UPDATE approval_chains SET is_active = FALSE WHERE name = $1 AND is_active
+       )
+       INSERT INTO approval_chains (name, version, steps, created_by)
+       SELECT $1, nv.version, $2::jsonb, $3 FROM next_version nv
+       RETURNING id, name, version, scope, steps, is_active, created_by, created_at`,
+      [name, JSON.stringify(normalizedSteps), user.id]
+    );
+    const chain = created.rows[0];
+
+    await logAudit(user.id, 'approval_chain_created', chain.id, {
+      name,
+      version: chain.version,
+      steps: normalizedSteps,
+    });
+
+    res.status(201).json({ chain });
+  } catch (err: any) {
+    console.error('[importers] failed to create approval chain:', err);
+    res.status(500).json({ error: 'failed to create approval chain' });
+  }
+});
+
+// POST /importers/admin/:id/review/start — open a chain instance for this
+// importer's review (uses the latest active chain unless chainId is given).
+importersRouter.post('/admin/:id/review/start', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  if (user.role !== 'surety_admin') {
+    res.status(403).json({ error: 'surety admin only' });
+    return;
+  }
+
+  const importerId = String(req.params.id ?? '');
+  if (!z.string().uuid().safeParse(importerId).success) {
+    res.status(400).json({ error: 'invalid importer id' });
+    return;
+  }
+  const parse = z.object({ chainId: z.string().uuid().optional() }).safeParse(req.body ?? {});
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+    return;
+  }
+
+  try {
+    const importer = await pool.query(
+      'SELECT id FROM importers WHERE id = $1 AND deleted_at IS NULL',
+      [importerId]
+    );
+    if (!importer.rowCount) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+
+    let chainResult;
+    if (parse.data.chainId) {
+      chainResult = await pool.query(
+        'SELECT id, name, version, steps FROM approval_chains WHERE id = $1',
+        [parse.data.chainId]
+      );
+      if (!chainResult.rowCount) {
+        res.status(404).json({ error: 'approval chain not found' });
+        return;
+      }
+    } else {
+      chainResult = await pool.query(
+        `SELECT id, name, version, steps FROM approval_chains
+         WHERE is_active
+         ORDER BY created_at DESC LIMIT 1`
+      );
+      if (!chainResult.rowCount) {
+        res.status(400).json({ error: 'no active approval chain configured' });
+        return;
+      }
+    }
+    const chain = chainResult.rows[0];
+
+    const existing = await pool.query(
+      `SELECT id FROM approval_chain_instances
+       WHERE importer_id = $1 AND status = 'in_progress'`,
+      [importerId]
+    );
+    if (existing.rowCount) {
+      res.status(409).json({ error: 'a review is already in progress for this importer' });
+      return;
+    }
+
+    const instanceResult = await pool.query(
+      `INSERT INTO approval_chain_instances
+         (chain_id, chain_version, importer_id, steps, started_by)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, chain_id, chain_version, importer_id, steps, current_step, status,
+                 started_by, decided_at, created_at`,
+      [chain.id, chain.version, importerId, JSON.stringify(chain.steps), user.id]
+    );
+
+    await logAudit(user.id, 'review_chain_started', importerId, {
+      instanceId: instanceResult.rows[0].id,
+      chainId: chain.id,
+      chainVersion: chain.version,
+      chainName: chain.name,
+    });
+
+    const approval = await getApprovalState(importerId);
+    res.status(201).json({ approval });
+  } catch (err: any) {
+    if (err?.code === '23505') {
+      res.status(409).json({ error: 'a review is already in progress for this importer' });
+      return;
+    }
+    console.error('[importers] failed to start review chain:', err);
+    res.status(500).json({ error: 'failed to start review chain' });
+  }
+});
+
+// POST /importers/admin/:id/review/decision — record the current step's
+// decision. Approval advances (or finalises on the last step); rejection
+// halts the chain and notifies the importer.
+importersRouter.post('/admin/:id/review/decision', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  if (user.role !== 'surety_admin') {
+    res.status(403).json({ error: 'surety admin only' });
+    return;
+  }
+
+  const importerId = String(req.params.id ?? '');
+  if (!z.string().uuid().safeParse(importerId).success) {
+    res.status(400).json({ error: 'invalid importer id' });
+    return;
+  }
+  const parse = z
+    .object({
+      decision: z.enum(['approved', 'rejected']),
+      note: z.string().max(1000).optional(),
+    })
+    .safeParse(req.body ?? {});
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+    return;
+  }
+  const { decision, note } = parse.data;
+
+  try {
+    const open = await pool.query(
+      `SELECT id, chain_version, steps, current_step, status
+       FROM approval_chain_instances
+       WHERE importer_id = $1 AND status = 'in_progress'
+       ORDER BY created_at DESC LIMIT 1`,
+      [importerId]
+    );
+    if (!open.rowCount) {
+      res.status(404).json({ error: 'no review in progress for this importer' });
+      return;
+    }
+    const instance = open.rows[0];
+    const steps = instance.steps as ApprovalChainStep[];
+    const stepIndex = Number(instance.current_step) - 1;
+    const step = steps[stepIndex];
+    if (!step) {
+      res.status(500).json({ error: 'chain state is inconsistent with its steps' });
+      return;
+    }
+
+    // Multi-person sign-off: every step needs a different surety admin.
+    const priorApprover = await pool.query(
+      'SELECT approver_id FROM approval_chain_decisions WHERE instance_id = $1 AND approver_id = $2',
+      [instance.id, user.id]
+    );
+    if (priorApprover.rowCount) {
+      res
+        .status(403)
+        .json({ error: 'a different surety admin must record each approval step' });
+      return;
+    }
+
+    await pool.query(
+      `INSERT INTO approval_chain_decisions
+         (instance_id, step_number, required_role, step_name, approver_id, decision, note)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [instance.id, step.step_number, step.required_role, step.name, user.id, decision, note ?? null]
+    );
+
+    const isLastStep = step.step_number >= steps.length;
+    let finalized = false;
+    let halted = false;
+    let importerKycStatus: string | null = null;
+
+    if (decision === 'rejected') {
+      halted = true;
+      await pool.query(
+        `UPDATE approval_chain_instances SET status = 'rejected', decided_at = now() WHERE id = $1`,
+        [instance.id]
+      );
+      await logAudit(user.id, 'review_chain_rejected', importerId, {
+        instanceId: instance.id,
+        stepNumber: step.step_number,
+        stepName: step.name,
+        note: note ?? null,
+      });
+
+      const owner = await pool.query('SELECT user_id FROM importers WHERE id = $1', [importerId]);
+      if (owner.rows[0]?.user_id) {
+        await createNotification(
+          owner.rows[0].user_id,
+          NOTIFICATION_KINDS.REVIEW_CHAIN_REJECTED,
+          `Your surety review was rejected at step ${step.step_number} ("${step.name}"). Contact your surety for next steps.`
+        );
+      }
+    } else if (isLastStep) {
+      finalized = true;
+      await pool.query(
+        `UPDATE approval_chain_instances SET status = 'approved', decided_at = now() WHERE id = $1`,
+        [instance.id]
+      );
+      // Finalisation only happens here — after every step has approved.
+      const kycResult = await pool.query(
+        `UPDATE importers SET kyc_status = 'approved'
+         WHERE id = $1 AND deleted_at IS NULL
+         RETURNING kyc_status`,
+        [importerId]
+      );
+      importerKycStatus = kycResult.rows[0]?.kyc_status ?? null;
+
+      await logAudit(user.id, 'review_chain_finalized', importerId, {
+        instanceId: instance.id,
+        chainVersion: instance.chain_version,
+        steps: steps.length,
+        importerKycStatus,
+      });
+
+      const owner = await pool.query('SELECT user_id FROM importers WHERE id = $1', [importerId]);
+      if (owner.rows[0]?.user_id) {
+        await createNotification(
+          owner.rows[0].user_id,
+          NOTIFICATION_KINDS.REVIEW_CHAIN_APPROVED,
+          'Your surety review was approved — all approval steps have signed off.'
+        );
+      }
+    } else {
+      await pool.query(
+        `UPDATE approval_chain_instances SET current_step = current_step + 1 WHERE id = $1`,
+        [instance.id]
+      );
+      await logAudit(user.id, 'review_chain_step_approved', importerId, {
+        instanceId: instance.id,
+        stepNumber: step.step_number,
+        stepName: step.name,
+        nextStep: step.step_number + 1,
+      });
+    }
+
+    const approval = await getApprovalState(importerId);
+    res.json({ approval, finalized, halted, importerKycStatus });
+  } catch (err: any) {
+    if (err?.code === '23505') {
+      res.status(409).json({ error: 'this step has already been decided' });
+      return;
+    }
+    console.error('[importers] failed to record review decision:', err);
+    res.status(500).json({ error: 'failed to record review decision' });
   }
 });
 
@@ -489,6 +876,61 @@ importersRouter.get('/:id/collateral-status', async (req: Request, res: Response
     lastUpdated: new Date(lastUpdatedSeconds * 1000).toISOString(),
     expiresAt: new Date(expiresAtSeconds * 1000).toISOString(),
   });
+});
+
+// ── #1007: credit-line visibility + credit-line-aware collateral health ─────
+
+// GET /importers/:id/credit-lines — active and historical credit lines for
+// the importer (owner) or any surety_admin.
+importersRouter.get('/:id/credit-lines', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+  const result = await pool.query(
+    `SELECT id, importer_id, granted_by, amount::text AS amount, reason, status,
+            granted_at, expires_at, revoked_at, revoked_by, notified_expiring, created_at
+     FROM credit_lines
+     WHERE importer_id = $1
+     ORDER BY created_at DESC`,
+    [importer.id]
+  );
+  res.json({ creditLines: result.rows });
+});
+
+// GET /importers/:id/collateral-health — the credit-line-aware health check.
+// Active credit lines count as temporary coverage of any shortfall; once a
+// line expires (or is revoked) it disappears from the calculation and the
+// strict requirement applies again.
+importersRouter.get('/:id/collateral-health', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+  try {
+    const [acct, creditLines] = await Promise.all([
+      contractClient.getAccount(importer.stellar_address),
+      getActiveCreditLines(importer.id),
+    ]);
+    const health = evaluateCollateralHealth({
+      balance: BigInt(acct.collateralBalance),
+      requiredCollateral: BigInt(acct.requiredCollateral),
+      creditLines,
+    });
+    res.json({
+      health,
+      strict: evaluateCollateralHealth({
+        balance: BigInt(acct.collateralBalance),
+        requiredCollateral: BigInt(acct.requiredCollateral),
+        creditLines: [],
+      }),
+    });
+  } catch (err) {
+    console.error('[importers] failed to assess collateral health:', err);
+    res.status(502).json({ error: 'failed to assess collateral health' });
+  }
 });
 
 // --- Synthetic CBP tariff CSV upload — recomputes required_collateral on-chain ---

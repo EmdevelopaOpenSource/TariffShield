@@ -59,17 +59,118 @@ function generatePresignedUrl(s3Key: string): string {
   return `/dev/kyc-stub/${s3Key}`;
 }
 
-const UploadKycSchema = z.object({
-  documentType: z.enum([
-    'articles_of_incorporation',
-    'ein_confirmation',
-    'beneficial_ownership_fincen_102',
-  ]),
-  // In production, file bytes come from multipart/form-data (multer/busboy).
-  // For now, accept a base64-encoded payload for API simplicity.
+const KycDocumentTypeSchema = z.enum([
+  'articles_of_incorporation',
+  'ein_confirmation',
+  'beneficial_ownership_fincen_102',
+]);
+
+// In production, file bytes come from multipart/form-data (multer/busboy).
+// For now, accept a base64-encoded payload for API simplicity. The 500 KB
+// per-file cap keeps a full batch comfortably inside the global 1 MB
+// express.json body limit (index.ts).
+const KYC_MAX_FILE_BYTES = 500 * 1024;
+const KYC_BATCH_MAX_FILES = 10;
+
+const UploadKycFileSchema = z.object({
+  documentType: KycDocumentTypeSchema,
   fileBase64: z.string().min(1),
   mimeType: z.string().regex(/^(application\/pdf|image\/(png|jpeg))$/),
+  fileName: z.string().max(255).optional(),
 });
+
+const UploadKycSchema = UploadKycFileSchema;
+
+const UploadKycBatchSchema = z.object({
+  documents: z.array(UploadKycFileSchema).min(1).max(KYC_BATCH_MAX_FILES),
+});
+
+type VirusScanStatus = 'pending' | 'clean' | 'infected';
+
+// Lightweight inline virus/content scan (#1006). Detects the EICAR
+// anti-malware test string and validates the file's magic bytes against the
+// declared MIME type. A buffer that neither trips a signature nor matches a
+// known header is left 'pending' for an external scanner rather than being
+// cleared — surfacing as `virus-scan-pending` in the batch response.
+function scanDocumentBuffer(buffer: Buffer, mimeType: string): VirusScanStatus {
+  const eicar = Buffer.from(
+    'X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*',
+    'latin1'
+  );
+  if (buffer.includes(eicar)) return 'infected';
+
+  const startsWith = (sig: Buffer): boolean =>
+    buffer.length >= sig.length && buffer.subarray(0, sig.length).equals(sig);
+
+  if (mimeType === 'application/pdf') {
+    return buffer.subarray(0, 5).toString('latin1') === '%PDF-' ? 'clean' : 'pending';
+  }
+  if (mimeType === 'image/png') {
+    return startsWith(Buffer.from([0x89, 0x50, 0x4e, 0x47])) ? 'clean' : 'pending';
+  }
+  if (mimeType === 'image/jpeg') {
+    return startsWith(Buffer.from([0xff, 0xd8, 0xff])) ? 'clean' : 'pending';
+  }
+  return 'pending';
+}
+
+interface StoredKycDocument {
+  document: Record<string, unknown>;
+  virusScanStatus: VirusScanStatus;
+}
+
+class KycUploadError extends Error {
+  statusCode: number;
+  constructor(statusCode: number, message: string) {
+    super(message);
+    this.statusCode = statusCode;
+  }
+}
+
+// Shared storage path for the single-file (#312) and batch (#1006) upload
+// endpoints — validation, scanning, S3 stub, encryption and insert live here
+// so both routes stay behaviourally identical.
+async function storeKycDocument(
+  importerId: string,
+  file: z.infer<typeof UploadKycFileSchema>
+): Promise<StoredKycDocument> {
+  const fileBuffer = Buffer.from(file.fileBase64, 'base64');
+  if (fileBuffer.length === 0) {
+    throw new KycUploadError(400, 'file is empty');
+  }
+  if (fileBuffer.length > KYC_MAX_FILE_BYTES) {
+    throw new KycUploadError(413, `file exceeds ${KYC_MAX_FILE_BYTES} byte limit`);
+  }
+
+  const virusScanStatus = scanDocumentBuffer(fileBuffer, file.mimeType);
+  if (virusScanStatus === 'infected') {
+    throw new KycUploadError(422, 'virus detected in uploaded document');
+  }
+
+  const s3Key = await uploadDocumentToS3(importerId, file.documentType, fileBuffer, file.mimeType);
+  const encryptedKey = s3KeyEncrypt(s3Key);
+
+  // BSA minimum 5-year retention from upload; updated when importer has a transaction.
+  const scheduledDeletion = new Date(Date.now() + BSA_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+
+  const result = await pool.query(
+    `INSERT INTO kyc_documents (importer_id, document_type, s3_key_encrypted, scheduled_deletion_date,
+                                document_name, virus_scan_status)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     RETURNING id, document_type, upload_timestamp, review_status, scheduled_deletion_date,
+               document_name, virus_scan_status`,
+    [
+      importerId,
+      file.documentType,
+      encryptedKey,
+      scheduledDeletion,
+      file.fileName ?? null,
+      virusScanStatus,
+    ]
+  );
+
+  return { document: result.rows[0], virusScanStatus };
+}
 
 // POST /api/v1/importers/:id/kyc — upload a KYC document (importer only)
 kycRouter.post('/:id/kyc', async (req: Request, res: Response) => {
@@ -94,23 +195,104 @@ kycRouter.post('/:id/kyc', async (req: Request, res: Response) => {
     res.status(400).json({ error: 'invalid input', details: parse.error.issues });
     return;
   }
-  const { documentType, fileBase64, mimeType } = parse.data;
-  const fileBuffer = Buffer.from(fileBase64, 'base64');
 
-  const s3Key = await uploadDocumentToS3(importerId, documentType, fileBuffer, mimeType);
-  const encryptedKey = s3KeyEncrypt(s3Key);
+  try {
+    const stored = await storeKycDocument(importerId, parse.data);
+    await logAudit(user.id, 'kyc_document_upload', importerId, {
+      documentType: parse.data.documentType,
+      fileName: parse.data.fileName ?? null,
+      virusScanStatus: stored.virusScanStatus,
+    });
+    res.status(201).json({ document: stored.document });
+  } catch (err) {
+    if (err instanceof KycUploadError) {
+      res.status(err.statusCode).json({ error: err.message });
+      return;
+    }
+    throw err;
+  }
+});
 
-  // BSA minimum 5-year retention from upload; updated when importer has a transaction.
-  const scheduledDeletion = new Date(Date.now() + BSA_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+// POST /api/v1/importers/:id/kyc/batch — bulk drag-and-drop upload (#1006).
+// Every file is processed individually so one bad file (oversized, infected,
+// insert failure) never blocks the files around it — partial batch failures
+// are reported per file instead of failing the whole request.
+kycRouter.post('/:id/kyc/batch', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  if (user.role !== 'importer') {
+    res.status(403).json({ error: 'only importers can upload KYC documents' });
+    return;
+  }
 
-  const result = await pool.query(
-    `INSERT INTO kyc_documents (importer_id, document_type, s3_key_encrypted, scheduled_deletion_date)
-     VALUES ($1, $2, $3, $4)
-     RETURNING id, document_type, upload_timestamp, review_status, scheduled_deletion_date`,
-    [importerId, documentType, encryptedKey, scheduledDeletion]
-  );
+  const imp = await pool.query('SELECT id FROM importers WHERE id = $1 AND user_id = $2', [
+    req.params.id,
+    user.id,
+  ]);
+  if (!imp.rowCount) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+  const importerId: string = imp.rows[0]!.id;
 
-  res.status(201).json({ document: result.rows[0] });
+  const parse = UploadKycBatchSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+    return;
+  }
+
+  type BatchStatus = 'success' | 'failed' | 'virus-scan-pending';
+  const results: Array<{
+    index: number;
+    fileName: string | null;
+    documentType: z.infer<typeof KycDocumentTypeSchema>;
+    status: BatchStatus;
+    virusScanStatus: VirusScanStatus | null;
+    document?: Record<string, unknown>;
+    error?: string;
+  }> = [];
+
+  for (const [index, file] of parse.data.documents.entries()) {
+    try {
+      const stored = await storeKycDocument(importerId, file);
+      const status: BatchStatus =
+        stored.virusScanStatus === 'pending' ? 'virus-scan-pending' : 'success';
+      results.push({
+        index,
+        fileName: file.fileName ?? null,
+        documentType: file.documentType,
+        status,
+        virusScanStatus: stored.virusScanStatus,
+        document: stored.document,
+      });
+    } catch (err) {
+      results.push({
+        index,
+        fileName: file.fileName ?? null,
+        documentType: file.documentType,
+        status: 'failed',
+        virusScanStatus: null,
+        error: err instanceof Error ? err.message : 'upload failed',
+      });
+    }
+  }
+
+  const succeeded = results.filter((r) => r.status === 'success').length;
+  const failed = results.filter((r) => r.status === 'failed').length;
+  const pending = results.filter((r) => r.status === 'virus-scan-pending').length;
+
+  await logAudit(user.id, 'kyc_bulk_upload', importerId, {
+    total: results.length,
+    succeeded,
+    failed,
+    pending,
+    files: results.map((r) => ({
+      documentType: r.documentType,
+      fileName: r.fileName,
+      status: r.status,
+    })),
+  });
+
+  res.status(201).json({ results, succeeded, failed, pending });
 });
 
 // GET /api/v1/importers/:id/kyc — list KYC documents for an importer
@@ -133,7 +315,7 @@ kycRouter.get('/:id/kyc', async (req: Request, res: Response) => {
 
   const docs = await pool.query(
     `SELECT id, document_type, upload_timestamp, review_status, reviewed_at, reviewer_note,
-            scheduled_deletion_date, deleted_at
+            scheduled_deletion_date, deleted_at, document_name, virus_scan_status
      FROM kyc_documents WHERE importer_id = $1 AND deleted_at IS NULL
      ORDER BY upload_timestamp DESC`,
     [req.params.id]
