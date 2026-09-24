@@ -46,6 +46,7 @@ import { suretyMarketplaceRouter, adminMarketplaceRouter } from './routes/surety
 import { startComplianceEscalation } from './jobs/compliance-escalation.js';
 import { startScheduledComplianceReportDelivery } from './jobs/scheduled-compliance-reports.js';
 import { complianceReportLinksRouter } from './routes/compliance-report-links.js';
+import { startScheduledDepositsJob } from './jobs/scheduled-deposits.js';
 
 const app = express();
 app.use(httpLogger);
@@ -380,6 +381,7 @@ async function start() {
   startOnboardingDripScheduler();
   startComplianceEscalation();
   startScheduledComplianceReportDelivery();
+  startScheduledDepositsJob();
   app.listen(env.PORT, () => {
     logger.info(
       {

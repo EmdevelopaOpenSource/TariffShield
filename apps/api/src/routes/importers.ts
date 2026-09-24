@@ -50,6 +50,7 @@ import {
   invalidateOnChainAccount,
   type OnChainAccountView,
 } from '../cache.js';
+import { computeNextRunAt } from '../services/deposit-schedules.js';
 
 export const importersRouter = Router();
 importersRouter.use(authMiddleware);
@@ -1484,7 +1485,7 @@ async function handleAttachDisputeEvidence(req: Request, res: Response): Promise
       res.status(404).json({ error: 'dispute not found' });
       return;
     }
-    disputeRow = r.rows[0];
+    disputeRow = r.rows[0]!;
   } else {
     const r = await pool.query(
       `SELECT id, importer_id, status FROM collateral_disputes
@@ -1496,7 +1497,7 @@ async function handleAttachDisputeEvidence(req: Request, res: Response): Promise
       res.status(404).json({ error: 'no open dispute found for importer' });
       return;
     }
-    disputeRow = r.rows[0];
+    disputeRow = r.rows[0]!;
   }
 
   // Attempting to attach evidence after resolve_dispute is rejected (#992 AC 5)
@@ -1547,7 +1548,7 @@ async function handleAttachDisputeEvidence(req: Request, res: Response): Promise
     ]
   );
 
-  const evidence = inserted.rows[0];
+  const evidence = inserted.rows[0]!;
 
   await logAudit(user.id, 'dispute_evidence_attached', importer.id, {
     disputeId: disputeRow.id,
@@ -1615,7 +1616,7 @@ importersRouter.get('/:id/disputes/evidence', async (req: Request, res: Response
     res.status(404).json({ error: 'no open dispute found' });
     return;
   }
-  const disputeId = openDispute.rows[0].id;
+  const disputeId = openDispute.rows[0]!.id;
   const evRes = await pool.query(
     `SELECT id, dispute_id, importer_id, file_name, mime_type, file_size_bytes,
             s3_key_encrypted, virus_scan_status, notes, created_at
@@ -1640,6 +1641,349 @@ importersRouter.get('/:id/disputes/evidence', async (req: Request, res: Response
   }));
   res.json({ disputeId, evidence });
 });
+
+// ── #993: Recurring Collateral Deposit Scheduling ───────────────────────────
+
+const CreateDepositScheduleSchema = z.object({
+  cadence: z.enum(['weekly', 'monthly']),
+  amountStroops: z
+    .union([z.string(), z.number()])
+    .transform((v) => String(v))
+    .refine((v) => /^\d+$/.test(v) && BigInt(v) > 0n, {
+      message: 'amountStroops must be a positive integer',
+    }),
+  bucket: z.enum(['collateral', 'reserve']).default('collateral').optional(),
+  startDate: z.string().optional(),
+});
+
+const UpdateDepositScheduleSchema = z.object({
+  cadence: z.enum(['weekly', 'monthly']).optional(),
+  amountStroops: z
+    .union([z.string(), z.number()])
+    .transform((v) => String(v))
+    .refine((v) => /^\d+$/.test(v) && BigInt(v) > 0n, {
+      message: 'amountStroops must be a positive integer',
+    })
+    .optional(),
+  bucket: z.enum(['collateral', 'reserve']).optional(),
+  status: z.enum(['active', 'paused', 'cancelled']).optional(),
+});
+
+// POST /importers/:id/deposit-schedule — configure recurring deposit schedule
+importersRouter.post('/:id/deposit-schedule', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  if (importer.kyc_status !== 'approved') {
+    res.status(403).json({
+      error: 'KYC approval required before collateral deposit scheduling',
+      kycStatus: importer.kyc_status,
+    });
+    return;
+  }
+
+  const parse = CreateDepositScheduleSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+    return;
+  }
+
+  const amlRes = await screenWalletAddress(importer.stellar_address);
+  if (amlRes.riskScore === 'HIGH') {
+    res.status(403).json({ error: 'Transaction blocked pending AML review' });
+    return;
+  }
+
+  let nextRunAt: Date;
+  if (parse.data.startDate) {
+    const parsedStart = new Date(parse.data.startDate);
+    if (!isNaN(parsedStart.getTime()) && parsedStart.getTime() > Date.now()) {
+      nextRunAt = parsedStart;
+    } else {
+      nextRunAt = computeNextRunAt(parse.data.cadence, new Date());
+    }
+  } else {
+    nextRunAt = computeNextRunAt(parse.data.cadence, new Date());
+  }
+
+  const inserted = await pool.query(
+    `INSERT INTO deposit_schedules (importer_id, user_id, cadence, amount_stroops, bucket, status, next_run_at)
+     VALUES ($1, $2, $3, $4, $5, 'active', $6)
+     RETURNING id, importer_id, user_id, cadence, amount_stroops::text AS amount_stroops,
+               bucket, status, next_run_at, last_run_at, created_at, updated_at`,
+    [
+      importer.id,
+      user.id,
+      parse.data.cadence,
+      parse.data.amountStroops,
+      parse.data.bucket ?? 'collateral',
+      nextRunAt,
+    ]
+  );
+
+  const schedule = inserted.rows[0]!;
+
+  await logAudit(user.id, 'create_deposit_schedule', importer.id, {
+    scheduleId: schedule.id,
+    cadence: parse.data.cadence,
+    amountStroops: parse.data.amountStroops,
+    bucket: parse.data.bucket ?? 'collateral',
+  });
+
+  res.status(201).json({ schedule });
+});
+
+// GET /importers/:id/deposit-schedule & GET /importers/:id/deposit-schedules — list active/all schedules
+async function handleListDepositSchedules(req: Request, res: Response): Promise<void> {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const r = await pool.query(
+    `SELECT id, importer_id, user_id, cadence, amount_stroops::text AS amount_stroops,
+            bucket, status, next_run_at, last_run_at, last_error, created_at, updated_at
+     FROM deposit_schedules
+     WHERE importer_id = $1
+     ORDER BY created_at DESC`,
+    [importer.id]
+  );
+
+  res.json({ schedules: r.rows });
+}
+
+importersRouter.get('/:id/deposit-schedule', handleListDepositSchedules);
+importersRouter.get('/:id/deposit-schedules', handleListDepositSchedules);
+
+// GET /importers/:id/deposit-schedule/history & GET /importers/:id/deposit-schedules/history
+async function handleListDepositScheduleHistory(req: Request, res: Response): Promise<void> {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const r = await pool.query(
+    `SELECT id, schedule_id, importer_id, amount_stroops::text AS amount_stroops,
+            bucket, status, job_id, error_message, executed_at
+     FROM deposit_schedule_executions
+     WHERE importer_id = $1
+     ORDER BY executed_at DESC`,
+    [importer.id]
+  );
+
+  res.json({ history: r.rows });
+}
+
+importersRouter.get('/:id/deposit-schedule/history', handleListDepositScheduleHistory);
+importersRouter.get('/:id/deposit-schedules/history', handleListDepositScheduleHistory);
+
+// GET /importers/:id/deposit-schedule/:scheduleId — get single schedule
+importersRouter.get('/:id/deposit-schedule/:scheduleId', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const r = await pool.query(
+    `SELECT id, importer_id, user_id, cadence, amount_stroops::text AS amount_stroops,
+            bucket, status, next_run_at, last_run_at, last_error, created_at, updated_at
+     FROM deposit_schedules
+     WHERE id = $1 AND importer_id = $2`,
+    [req.params.scheduleId, importer.id]
+  );
+
+  if (!r.rowCount) {
+    res.status(404).json({ error: 'deposit schedule not found' });
+    return;
+  }
+
+  res.json({ schedule: r.rows[0]! });
+});
+
+// GET /importers/:id/deposit-schedule/:scheduleId/history — get history for specific schedule
+importersRouter.get('/:id/deposit-schedule/:scheduleId/history', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const r = await pool.query(
+    `SELECT id, schedule_id, importer_id, amount_stroops::text AS amount_stroops,
+            bucket, status, job_id, error_message, executed_at
+     FROM deposit_schedule_executions
+     WHERE schedule_id = $1 AND importer_id = $2
+     ORDER BY executed_at DESC`,
+    [req.params.scheduleId, importer.id]
+  );
+
+  res.json({ history: r.rows });
+});
+
+// POST /importers/:id/deposit-schedule/:scheduleId/pause — pause schedule
+importersRouter.post('/:id/deposit-schedule/:scheduleId/pause', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const r = await pool.query(
+    `UPDATE deposit_schedules
+     SET status = 'paused', updated_at = now()
+     WHERE id = $1 AND importer_id = $2
+     RETURNING id, importer_id, user_id, cadence, amount_stroops::text AS amount_stroops,
+               bucket, status, next_run_at, last_run_at, last_error, created_at, updated_at`,
+    [req.params.scheduleId, importer.id]
+  );
+
+  if (!r.rowCount) {
+    res.status(404).json({ error: 'deposit schedule not found' });
+    return;
+  }
+
+  await logAudit(user.id, 'pause_deposit_schedule', importer.id, {
+    scheduleId: req.params.scheduleId,
+  });
+
+  res.json({ schedule: r.rows[0]! });
+});
+
+// POST /importers/:id/deposit-schedule/:scheduleId/resume — resume schedule
+importersRouter.post('/:id/deposit-schedule/:scheduleId/resume', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const existing = await pool.query(
+    `SELECT id, cadence, next_run_at FROM deposit_schedules WHERE id = $1 AND importer_id = $2`,
+    [req.params.scheduleId, importer.id]
+  );
+
+  if (!existing.rowCount) {
+    res.status(404).json({ error: 'deposit schedule not found' });
+    return;
+  }
+
+  const current = existing.rows[0]!;
+  let nextRunAt = current.next_run_at;
+  if (new Date(nextRunAt).getTime() <= Date.now()) {
+    nextRunAt = computeNextRunAt(current.cadence, new Date());
+  }
+
+  const r = await pool.query(
+    `UPDATE deposit_schedules
+     SET status = 'active', next_run_at = $3, updated_at = now()
+     WHERE id = $1 AND importer_id = $2
+     RETURNING id, importer_id, user_id, cadence, amount_stroops::text AS amount_stroops,
+               bucket, status, next_run_at, last_run_at, last_error, created_at, updated_at`,
+    [req.params.scheduleId, importer.id, nextRunAt]
+  );
+
+  await logAudit(user.id, 'resume_deposit_schedule', importer.id, {
+    scheduleId: req.params.scheduleId,
+  });
+
+  res.json({ schedule: r.rows[0]! });
+});
+
+// PATCH /importers/:id/deposit-schedule/:scheduleId — edit schedule
+importersRouter.patch('/:id/deposit-schedule/:scheduleId', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const parse = UpdateDepositScheduleSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+    return;
+  }
+
+  const { cadence, amountStroops, bucket, status } = parse.data;
+  if (!cadence && !amountStroops && !bucket && !status) {
+    res.status(400).json({ error: 'no fields provided to update' });
+    return;
+  }
+
+  const existing = await pool.query(
+    `SELECT id, cadence, amount_stroops, bucket, status, next_run_at FROM deposit_schedules WHERE id = $1 AND importer_id = $2`,
+    [req.params.scheduleId, importer.id]
+  );
+
+  if (!existing.rowCount) {
+    res.status(404).json({ error: 'deposit schedule not found' });
+    return;
+  }
+
+  const cur = existing.rows[0]!;
+  const newCadence = cadence ?? cur.cadence;
+  const newAmount = amountStroops ?? cur.amount_stroops;
+  const newBucket = bucket ?? cur.bucket;
+  const newStatus = status ?? cur.status;
+
+  const r = await pool.query(
+    `UPDATE deposit_schedules
+     SET cadence = $3, amount_stroops = $4, bucket = $5, status = $6, updated_at = now()
+     WHERE id = $1 AND importer_id = $2
+     RETURNING id, importer_id, user_id, cadence, amount_stroops::text AS amount_stroops,
+               bucket, status, next_run_at, last_run_at, last_error, created_at, updated_at`,
+    [req.params.scheduleId, importer.id, newCadence, newAmount, newBucket, newStatus]
+  );
+
+  await logAudit(user.id, 'update_deposit_schedule', importer.id, {
+    scheduleId: req.params.scheduleId,
+    changes: parse.data,
+  });
+
+  res.json({ schedule: r.rows[0]! });
+});
+
+// POST /importers/:id/deposit-schedule/:scheduleId/cancel & DELETE /importers/:id/deposit-schedule/:scheduleId — cancel schedule
+async function handleCancelDepositSchedule(req: Request, res: Response): Promise<void> {
+  const user = (req as AuthedRequest).user;
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const r = await pool.query(
+    `UPDATE deposit_schedules
+     SET status = 'cancelled', updated_at = now()
+     WHERE id = $1 AND importer_id = $2
+     RETURNING id, importer_id, user_id, cadence, amount_stroops::text AS amount_stroops,
+               bucket, status, next_run_at, last_run_at, last_error, created_at, updated_at`,
+    [req.params.scheduleId, importer.id]
+  );
+
+  if (!r.rowCount) {
+    res.status(404).json({ error: 'deposit schedule not found' });
+    return;
+  }
+
+  await logAudit(user.id, 'cancel_deposit_schedule', importer.id, {
+    scheduleId: req.params.scheduleId,
+  });
+
+  res.json({ success: true, schedule: r.rows[0]! });
+}
+
+importersRouter.post('/:id/deposit-schedule/:scheduleId/cancel', handleCancelDepositSchedule);
+importersRouter.delete('/:id/deposit-schedule/:scheduleId', handleCancelDepositSchedule);
 
 // ── #1038: Dual Sign-Off Approval Configuration & Withdrawal Workflow ───────
 
