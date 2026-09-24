@@ -728,6 +728,128 @@ export const openApiSpec = {
         },
       },
     },
+    '/compliance/report-schedules': {
+      get: {
+        tags: ['Compliance'],
+        summary: 'List scheduled report deliveries',
+        responses: {
+          200: { description: 'Report schedules for this surety' },
+          403: { description: 'Insufficient role' },
+        },
+      },
+      post: {
+        tags: ['Compliance'],
+        summary: 'Create a scheduled report delivery',
+        description:
+          'Generates the report type on a weekly (Mondays) or monthly (1st) cadence at 06:00 UTC and emails each recipient a unique, expiring download link. Failed sends are retried with backoff.',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  report_type: { type: 'string', enum: ['compliance_summary'] },
+                  cadence: { type: 'string', enum: ['weekly', 'monthly'] },
+                  recipients: {
+                    type: 'array',
+                    items: { type: 'string', format: 'email' },
+                    minItems: 1,
+                    maxItems: 20,
+                  },
+                },
+                required: ['report_type', 'cadence', 'recipients'],
+              },
+            },
+          },
+        },
+        responses: {
+          201: { description: 'Schedule created' },
+          400: { description: 'Invalid input' },
+          403: { description: 'Insufficient role' },
+        },
+      },
+    },
+    '/compliance/report-schedules/{id}': {
+      put: {
+        tags: ['Compliance'],
+        summary: 'Edit, pause or resume a report schedule',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  report_type: { type: 'string', enum: ['compliance_summary'] },
+                  cadence: { type: 'string', enum: ['weekly', 'monthly'] },
+                  recipients: {
+                    type: 'array',
+                    items: { type: 'string', format: 'email' },
+                    minItems: 1,
+                    maxItems: 20,
+                  },
+                  is_paused: { type: 'boolean' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: 'Schedule updated' },
+          400: { description: 'Invalid input' },
+          404: { description: 'Schedule not found' },
+        },
+      },
+      delete: {
+        tags: ['Compliance'],
+        summary: 'Delete a report schedule',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        responses: {
+          200: { description: 'Schedule deleted; previously generated reports are kept' },
+          404: { description: 'Schedule not found' },
+        },
+      },
+    },
+    '/compliance/report-schedules/{id}/deliveries': {
+      get: {
+        tags: ['Compliance'],
+        summary: 'Delivery log for a report schedule',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+          {
+            name: 'status',
+            in: 'query',
+            schema: { type: 'string', enum: ['pending', 'sent', 'failed'] },
+          },
+          { name: 'limit', in: 'query', schema: { type: 'integer', maximum: 100, default: 50 } },
+          { name: 'offset', in: 'query', schema: { type: 'integer', default: 0 } },
+        ],
+        responses: {
+          200: { description: 'Deliveries with attempt count and last error' },
+          404: { description: 'Schedule not found' },
+        },
+      },
+    },
+    '/compliance-report-links/{token}': {
+      get: {
+        tags: ['Compliance'],
+        summary: 'Open an emailed report download link',
+        description:
+          'Unauthenticated; the token is the credential. Redirects to a short-lived pre-signed report URL.',
+        security: [],
+        parameters: [{ name: 'token', in: 'path', required: true, schema: { type: 'string' } }],
+        responses: {
+          302: { description: 'Redirect to the report PDF' },
+          404: { description: 'Link unknown, expired, or report PDF unavailable' },
+        },
+      },
+    },
     '/surety-license/submit': {
       post: {
         tags: ['Surety License'],

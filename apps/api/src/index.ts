@@ -43,6 +43,8 @@ import { startApiKeyUsagePruneScheduler } from './jobs/prune-api-key-usage.js';
 import { startOnboardingDripScheduler } from './services/onboarding-drip.js';
 import { suretyMarketplaceRouter, adminMarketplaceRouter } from './routes/surety-marketplace.js';
 import { startComplianceEscalation } from './jobs/compliance-escalation.js';
+import { startScheduledComplianceReportDelivery } from './jobs/scheduled-compliance-reports.js';
+import { complianceReportLinksRouter } from './routes/compliance-report-links.js';
 
 const app = express();
 app.use(httpLogger);
@@ -329,6 +331,7 @@ app.use('/auth', authRouter);
 app.use('/importers', importersRouter);
 app.use('/importers', kycRouter);
 app.use('/compliance', complianceRouter);
+app.use('/compliance-report-links', complianceReportLinksRouter); // unauthenticated, token-gated
 app.use('/admin', adminRouter);
 app.use('/account', privacyRouter);
 app.use('/account', tosRouter);
@@ -374,6 +377,7 @@ async function start() {
   startApiKeyUsagePruneScheduler();
   startOnboardingDripScheduler();
   startComplianceEscalation();
+  startScheduledComplianceReportDelivery();
   app.listen(env.PORT, () => {
     logger.info(
       {

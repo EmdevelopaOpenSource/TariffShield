@@ -201,6 +201,13 @@ export const Env = z.object({
     .email()
     .optional()
     .describe('From address for compliance report notification emails'),
+  API_PUBLIC_URL: z
+    .string()
+    .url()
+    .default('http://localhost:3002')
+    .describe(
+      'Externally reachable base URL of this API, used to build secure download links in scheduled compliance report emails (#1013)'
+    ),
 });
 
 const parsed = Env.safeParse(process.env);

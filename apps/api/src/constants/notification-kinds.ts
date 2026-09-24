@@ -13,6 +13,7 @@ export const NOTIFICATION_KINDS = {
   UPGRADE_CANCELLED: 'upgrade_cancelled',
   SLA_BREACH: 'sla_breach',
   ONBOARDING_DRIP: 'onboarding_drip',
+  REPORT_DELIVERY_FAILED: 'report_delivery_failed',
 } as const;
 
 export type NotificationKind = (typeof NOTIFICATION_KINDS)[keyof typeof NOTIFICATION_KINDS];
