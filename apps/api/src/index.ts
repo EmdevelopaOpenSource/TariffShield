@@ -39,6 +39,7 @@ import { developerRouter } from './routes/developer.js';
 import { onboardingRouter } from './routes/onboarding.js';
 import { npsRouter } from './routes/nps.js';
 import { reportTemplatesRouter } from './routes/report-templates.js';
+import { brandingRouter, brandingPublicRouter } from './routes/branding.js';
 import { apiKeyUsageMeter } from './services/api-key-usage.js';
 import { startApiKeyUsagePruneScheduler } from './jobs/prune-api-key-usage.js';
 import { startOnboardingDripScheduler } from './services/onboarding-drip.js';
@@ -346,6 +347,8 @@ app.use('/developer', developerRouter);
 app.use('/onboarding', onboardingRouter);
 app.use('/nps', npsRouter);
 app.use('/report-templates', reportTemplatesRouter);
+app.use('/branding/public', brandingPublicRouter); // unauthenticated, presentation-only
+app.use('/branding', brandingRouter);
 app.use('/api/v1/regulatory', regulatoryRouter);
 app.use('/bonds', bondWebhookRouter); // unauthenticated DocuSign webhook
 app.use('/api', bondSignaturesRouter); // authenticated bond signature routes

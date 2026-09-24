@@ -4,10 +4,13 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
 import { clearSession, getUser, type AuthUser } from '@/lib/auth';
+import { useBranding } from '@/lib/branding';
 
 export function Nav() {
   const router = useRouter();
   const [user, setUser] = useState<AuthUser | null>(null);
+  // #998: partner/surety white-label branding, resolved at render time.
+  const branding = useBranding();
   const network =
     (typeof process !== 'undefined' && process.env.NEXT_PUBLIC_STELLAR_NETWORK) || 'testnet';
 
@@ -26,9 +29,19 @@ export function Nav() {
         <div className="flex items-center gap-3">
           <Link
             href={user ? (user.role === 'surety_admin' ? '/surety' : '/app') : '/'}
-            className="text-lg font-semibold tracking-tight text-foreground"
+            className="flex items-center gap-2 text-lg font-semibold tracking-tight text-foreground"
           >
-            <span className="text-accent">▲</span> TariffShield
+            {branding.logoDataUrl ? (
+              // eslint-disable-next-line @next/next/no-img-element -- data URL, nothing to optimise
+              <img
+                src={branding.logoDataUrl}
+                alt={`${branding.brandName} logo`}
+                className="h-7 w-auto max-w-[120px] object-contain"
+              />
+            ) : (
+              <span className="text-accent">▲</span>
+            )}
+            <span>{branding.brandName}</span>
           </Link>
           <span
             className={`text-xs font-semibold px-2 py-1 rounded-full ${network === 'mainnet' ? 'bg-danger/20 text-danger' : 'bg-accent/20 text-accent'}`}
@@ -49,7 +62,10 @@ export function Nav() {
                     Surety admin
                   </Link>
                 )}
-                <span className="text-[11px] text-muted sm:hidden max-w-[130px] truncate" title={user.email}>
+                <span
+                  className="text-[11px] text-muted sm:hidden max-w-[130px] truncate"
+                  title={user.email}
+                >
                   {user.email}
                 </span>
               </div>

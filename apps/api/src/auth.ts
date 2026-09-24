@@ -51,6 +51,9 @@ export const ROLE_PERMISSIONS = {
     'POST /surety-license/submit',
     'GET /surety-license/status',
     'GET /api/v1/regulatory/state-report/:state_code',
+    'GET /branding',
+    'PUT /branding',
+    'DELETE /branding',
   ],
   admin: ['ALL — reserved for platform operator via direct DB or Stellar keypair operations'],
 } as const;
