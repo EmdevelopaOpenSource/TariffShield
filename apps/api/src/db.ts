@@ -712,6 +712,30 @@ export async function rollback(): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_scheduled_withdrawals_due
       ON scheduled_withdrawals(target_date) WHERE status = 'pending';
 
+    -- #995: self-service API key management
+    CREATE TABLE IF NOT EXISTS api_keys (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      importer_id UUID REFERENCES importers(id) ON DELETE CASCADE,
+      key_hash TEXT NOT NULL UNIQUE,
+      prefix TEXT NOT NULL,
+      label TEXT,
+      scopes TEXT[] NOT NULL DEFAULT '{}',
+      rate_limit_per_min INTEGER DEFAULT 60,
+      last_used_at TIMESTAMPTZ,
+      expires_at TIMESTAMPTZ,
+      revoked_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS importer_id UUID REFERENCES importers(id) ON DELETE CASCADE;
+    ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS rate_limit_per_min INTEGER DEFAULT 60;
+
+    CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id);
+    CREATE INDEX IF NOT EXISTS idx_api_keys_importer_id ON api_keys(importer_id);
+    CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+
     -- Oracle price feed: durable audit trail of every set_required_collateral event.
     CREATE TABLE IF NOT EXISTS oracle_price_feed (
       id                   UUID          PRIMARY KEY DEFAULT uuid_generate_v4(),

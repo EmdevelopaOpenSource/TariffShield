@@ -723,6 +723,12 @@ importersRouter.post('/admin/:id/review/decision', async (req: Request, res: Res
 
 async function loadImporterFor(req: Request, importerId: string) {
   const user = (req as AuthedRequest).user;
+  // If request is authenticated with an importer-scoped API key, strictly enforce importer scoping (#995)
+  if (user.apiKeyId && user.importerId) {
+    if (importerId !== user.importerId) {
+      return null;
+    }
+  }
   if (user.role === 'surety_admin') {
     const r = await pool.query('SELECT * FROM importers WHERE id = $1', [importerId]);
     return r.rows[0] ?? null;

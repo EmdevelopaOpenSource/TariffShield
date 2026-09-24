@@ -1,8 +1,10 @@
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import { createHash } from 'crypto';
 import type { NextFunction, Request, Response } from 'express';
 import { env } from './config/env.js';
 import { pool, validateSession, touchSession } from './db.js';
+import { checkApiKeyRateLimit } from './services/api-key-rate-limiter.js';
 
 // ── SOC 2 CC6.3 — Formal RBAC access matrix ──────────────────────────────────
 // Documents the least-privilege role assignments enforced per route group.
@@ -66,6 +68,8 @@ export interface AuthPayload {
   email: string;
   role: 'importer' | 'surety_admin';
   sessionId?: string;
+  apiKeyId?: string;
+  importerId?: string;
 }
 
 export interface AuthedRequest extends Request {
@@ -84,15 +88,100 @@ export function signToken(payload: AuthPayload): string {
   return jwt.sign(payload, env.JWT_SECRET, { expiresIn: '7d' });
 }
 
-export function authMiddleware(req: Request, res: Response, next: NextFunction): void {
-  const header = req.header('authorization');
-  if (!header?.startsWith('Bearer ')) {
+export async function authMiddleware(req: Request, res: Response, next: NextFunction): Promise<void> {
+  const apiKeyHeader = req.header('x-api-key');
+  const authHeader = req.header('authorization');
+
+  // Check for API key in X-Api-Key or Authorization: Bearer ts_live_... / ApiKey ... (#995)
+  let rawApiKey: string | null = null;
+  if (apiKeyHeader) {
+    rawApiKey = apiKeyHeader.trim();
+  } else if (authHeader?.startsWith('ApiKey ')) {
+    rawApiKey = authHeader.slice(7).trim();
+  } else if (authHeader?.startsWith('Bearer ts_live_')) {
+    rawApiKey = authHeader.slice(7).trim();
+  }
+
+  if (rawApiKey) {
+    const keyHash = createHash('sha256').update(rawApiKey).digest('hex');
+    try {
+      const keyRes = await pool.query<{
+        id: string;
+        user_id: string;
+        importer_id: string | null;
+        scopes: string[];
+        rate_limit_per_min: number | null;
+        revoked_at: Date | null;
+        expires_at: Date | null;
+        email: string;
+        role: 'importer' | 'surety_admin';
+      }>(
+        `SELECT k.id, k.user_id, k.importer_id, k.scopes, k.rate_limit_per_min,
+                k.revoked_at, k.expires_at, u.email, u.role
+         FROM api_keys k
+         JOIN users u ON u.id = k.user_id
+         WHERE k.key_hash = $1`,
+        [keyHash]
+      );
+
+      if (!keyRes.rowCount) {
+        res.status(401).json({ error: 'invalid api key' });
+        return;
+      }
+
+      const keyRow = keyRes.rows[0]!;
+
+      // Revoked keys immediately return 401 on subsequent requests (#995 AC 5)
+      if (keyRow.revoked_at) {
+        res.status(401).json({ error: 'api key is revoked' });
+        return;
+      }
+
+      // Expired keys check
+      if (keyRow.expires_at && new Date(keyRow.expires_at).getTime() <= Date.now()) {
+        res.status(401).json({ error: 'api key has expired' });
+        return;
+      }
+
+      // Independent rate limiting per API key (#995 AC 3)
+      const limit = keyRow.rate_limit_per_min || 60;
+      const rateCheck = checkApiKeyRateLimit(keyRow.id, limit);
+      res.setHeader('X-RateLimit-Limit', String(limit));
+      res.setHeader('X-RateLimit-Remaining', String(rateCheck.remaining));
+      if (!rateCheck.allowed) {
+        res.setHeader('Retry-After', String(Math.ceil(rateCheck.resetMs / 1000)));
+        res.status(429).json({ error: 'rate limit exceeded', message: 'API key rate limit exceeded' });
+        return;
+      }
+
+      // Touch last_used_at asynchronously
+      pool.query('UPDATE api_keys SET last_used_at = now() WHERE id = $1', [keyRow.id]).catch(() => undefined);
+
+      (req as AuthedRequest).user = {
+        id: keyRow.user_id,
+        email: keyRow.email,
+        role: keyRow.role,
+        apiKeyId: keyRow.id,
+        importerId: keyRow.importer_id ?? undefined,
+        sessionId: 'api-key-auth',
+      };
+
+      next();
+      return;
+    } catch {
+      res.status(503).json({ error: 'api key validation unavailable' });
+      return;
+    }
+  }
+
+  // Session-based JWT authentication
+  if (!authHeader?.startsWith('Bearer ')) {
     res.status(401).json({ error: 'missing bearer token' });
     return;
   }
   let payload: AuthPayload;
   try {
-    payload = jwt.verify(header.slice(7), env.JWT_SECRET) as AuthPayload;
+    payload = jwt.verify(authHeader.slice(7), env.JWT_SECRET) as AuthPayload;
   } catch {
     res.status(401).json({ error: 'invalid token' });
     return;
@@ -146,7 +235,7 @@ const PRIVACY_EXEMPT_PATHS = [
 
 export function privacyReacceptanceGate(req: Request, res: Response, next: NextFunction): void {
   const user = (req as AuthedRequest).user;
-  if (!user) {
+  if (!user || user.apiKeyId) {
     next();
     return;
   }
@@ -184,7 +273,7 @@ export function privacyReacceptanceGate(req: Request, res: Response, next: NextF
 
 export function tosReacceptanceGate(req: Request, res: Response, next: NextFunction): void {
   const user = (req as AuthedRequest).user;
-  if (!user) {
+  if (!user || user.apiKeyId) {
     next();
     return;
   }
