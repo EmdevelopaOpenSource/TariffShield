@@ -9,6 +9,12 @@ import {
   type AuthedRequest,
 } from '../auth.js';
 import { getReportTemplate } from './report-templates.js';
+import { REPORT_URL_EXPIRES_IN_SECONDS, presignReportUrl } from '../jobs/compliance-report.js';
+import {
+  REPORT_CADENCES,
+  SCHEDULED_REPORT_TYPES,
+  computeNextRunAt,
+} from '../jobs/scheduled-compliance-reports.js';
 
 export const complianceRouter = Router();
 complianceRouter.use(authMiddleware);
@@ -432,10 +438,11 @@ complianceRouter.get('/reports', async (req: Request, res: Response) => {
   const user = (req as AuthedRequest).user;
 
   const reports = await pool.query(
-    `SELECT id, report_month, generated_at, pdf_s3_key IS NOT NULL AS has_pdf, superseded_at
+    `SELECT id, report_month, period_end, schedule_id, generated_at,
+            pdf_s3_key IS NOT NULL AS has_pdf, superseded_at
      FROM compliance_reports
      WHERE surety_id = $1
-     ORDER BY report_month DESC`,
+     ORDER BY report_month DESC, generated_at DESC`,
     [user.id]
   );
   res.json({ reports: reports.rows });
@@ -456,13 +463,197 @@ complianceRouter.get('/reports/:id/download', async (req: Request, res: Response
   }
 
   const key: string = reportRow.pdf_s3_key;
-  // In production, generate a pre-signed S3 GetObject URL here.
-  const url = `/dev/reports/${key}`;
+  const url = presignReportUrl(key);
   // #1032: the tenant's branded export template — the PDF renderer applies
   // logo/header/footer from this when generating the file at `key`; it does
   // not change the underlying report data the PDF is built from.
   const reportTemplate = await getReportTemplate(user.id);
-  res.json({ url, expiresInSeconds: 900, reportTemplate });
+  res.json({ url, expiresInSeconds: REPORT_URL_EXPIRES_IN_SECONDS, reportTemplate });
+});
+
+// ── #1013: scheduled automated report delivery ──────────────────────────────
+
+const SCHEDULE_COLUMNS = `id, surety_id, report_type, cadence, recipients, is_paused,
+  next_run_at, last_run_at, last_error, created_at, updated_at`;
+
+const recipientsSchema = z.array(z.string().email()).min(1).max(20);
+
+// GET /api/v1/compliance/report-schedules
+complianceRouter.get('/report-schedules', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  const schedules = await pool.query(
+    `SELECT ${SCHEDULE_COLUMNS} FROM compliance_report_schedules
+     WHERE surety_id = $1
+     ORDER BY created_at DESC`,
+    [user.id]
+  );
+  res.json({ schedules: schedules.rows });
+});
+
+// POST /api/v1/compliance/report-schedules
+complianceRouter.post('/report-schedules', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  const parse = z
+    .object({
+      report_type: z.enum(SCHEDULED_REPORT_TYPES),
+      cadence: z.enum(REPORT_CADENCES),
+      recipients: recipientsSchema,
+    })
+    .safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error });
+    return;
+  }
+
+  const { report_type, cadence, recipients } = parse.data;
+  const result = await pool.query(
+    `INSERT INTO compliance_report_schedules
+       (surety_id, report_type, cadence, recipients, next_run_at)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING ${SCHEDULE_COLUMNS}`,
+    [user.id, report_type, cadence, [...new Set(recipients)], computeNextRunAt(cadence, new Date())]
+  );
+
+  res.status(201).json({ schedule: result.rows[0] });
+});
+
+// PUT /api/v1/compliance/report-schedules/:id — edit, pause (is_paused: true) or resume
+complianceRouter.put('/report-schedules/:id', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  const parse = z
+    .object({
+      report_type: z.enum(SCHEDULED_REPORT_TYPES).optional(),
+      cadence: z.enum(REPORT_CADENCES).optional(),
+      recipients: recipientsSchema.optional(),
+      is_paused: z.boolean().optional(),
+    })
+    .safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error });
+    return;
+  }
+
+  const existing = await pool.query<{
+    cadence: (typeof REPORT_CADENCES)[number];
+    is_paused: boolean;
+    next_run_at: Date;
+  }>(
+    `SELECT cadence, is_paused, next_run_at FROM compliance_report_schedules
+     WHERE id = $1 AND surety_id = $2`,
+    [req.params.id, user.id]
+  );
+  const current = existing.rows[0];
+  if (!current) {
+    res.status(404).json({ error: 'report schedule not found' });
+    return;
+  }
+
+  const updates: string[] = ['updated_at = now()'];
+  const params: unknown[] = [];
+  let idx = 1;
+
+  if (parse.data.report_type !== undefined) {
+    updates.push(`report_type = $${idx++}`);
+    params.push(parse.data.report_type);
+  }
+  if (parse.data.cadence !== undefined) {
+    updates.push(`cadence = $${idx++}`);
+    params.push(parse.data.cadence);
+  }
+  if (parse.data.recipients !== undefined) {
+    updates.push(`recipients = $${idx++}`);
+    params.push([...new Set(parse.data.recipients)]);
+  }
+  if (parse.data.is_paused !== undefined) {
+    updates.push(`is_paused = $${idx++}`);
+    params.push(parse.data.is_paused);
+  }
+
+  // Re-anchor the next run when the cadence changes, or when resuming a
+  // schedule whose slot passed while paused (so it doesn't fire immediately).
+  const cadence = parse.data.cadence ?? current.cadence;
+  const resuming = current.is_paused && parse.data.is_paused === false;
+  const slotPassed = new Date(current.next_run_at) <= new Date();
+  if (
+    (parse.data.cadence !== undefined && parse.data.cadence !== current.cadence) ||
+    (resuming && slotPassed)
+  ) {
+    updates.push(`next_run_at = $${idx++}`);
+    params.push(computeNextRunAt(cadence, new Date()));
+  }
+
+  params.push(req.params.id);
+  const result = await pool.query(
+    `UPDATE compliance_report_schedules
+     SET ${updates.join(', ')}
+     WHERE id = $${idx}
+     RETURNING ${SCHEDULE_COLUMNS}`,
+    params
+  );
+
+  res.json({ schedule: result.rows[0] });
+});
+
+// DELETE /api/v1/compliance/report-schedules/:id — generated reports are kept
+complianceRouter.delete('/report-schedules/:id', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  const result = await pool.query(
+    `DELETE FROM compliance_report_schedules
+     WHERE id = $1 AND surety_id = $2
+     RETURNING id`,
+    [req.params.id, user.id]
+  );
+  if (!result.rowCount) {
+    res.status(404).json({ error: 'report schedule not found' });
+    return;
+  }
+
+  res.json({ success: true });
+});
+
+// GET /api/v1/compliance/report-schedules/:id/deliveries — delivery log incl. failures
+complianceRouter.get('/report-schedules/:id/deliveries', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  const query = z
+    .object({
+      status: z.enum(['pending', 'sent', 'failed']).optional(),
+      limit: z.coerce.number().int().positive().max(100).default(50),
+      offset: z.coerce.number().int().min(0).default(0),
+    })
+    .safeParse(req.query);
+  if (!query.success) {
+    res.status(400).json({ error: 'invalid query parameters' });
+    return;
+  }
+
+  const schedule = await pool.query(
+    `SELECT id FROM compliance_report_schedules WHERE id = $1 AND surety_id = $2`,
+    [req.params.id, user.id]
+  );
+  if (!schedule.rowCount) {
+    res.status(404).json({ error: 'report schedule not found' });
+    return;
+  }
+
+  const { status, limit, offset } = query.data;
+  const deliveries = await pool.query(
+    `SELECT d.id, d.report_id, r.report_month, r.period_end, d.recipient, d.status,
+            d.attempts, d.last_error, d.next_attempt_at, d.sent_at, d.token_expires_at,
+            d.last_accessed_at, d.created_at
+     FROM compliance_report_deliveries d
+     JOIN compliance_reports r ON r.id = d.report_id
+     WHERE d.schedule_id = $1 AND ($2::text IS NULL OR d.status = $2)
+     ORDER BY d.created_at DESC
+     LIMIT $3 OFFSET $4`,
+    [req.params.id, status ?? null, limit, offset]
+  );
+
+  res.json({ deliveries: deliveries.rows, limit, offset });
 });
 
 // GET /api/v1/compliance/escalation-rules — list escalation rules

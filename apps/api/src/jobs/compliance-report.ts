@@ -5,7 +5,7 @@ import { env } from '../config/env.js';
 // Scheduled to run on the first business day of each month.
 // Re-running for the same month overwrites the draft and marks the previous version superseded.
 
-interface ReportData {
+export interface ReportData {
   month: string; // YYYY-MM
   bondPortfolio: {
     totalActive: number;
@@ -31,7 +31,7 @@ interface ReportData {
   };
 }
 
-async function buildReportData(monthStart: Date, monthEnd: Date): Promise<ReportData> {
+export async function buildReportData(monthStart: Date, monthEnd: Date): Promise<ReportData> {
   const month = monthStart.toISOString().slice(0, 7);
 
   const [
@@ -134,14 +134,24 @@ async function buildReportData(monthStart: Date, monthEnd: Date): Promise<Report
 }
 
 // Stub: in production, render HTML via Puppeteer/PDFKit and upload to S3_REPORTS_BUCKET.
-async function generateAndUploadPdf(
+// `keyName` defaults to the report month; scheduled (#1013) reports pass a
+// schedule+period specific name so weekly reports don't overwrite each other.
+export async function generateAndUploadPdf(
   reportData: ReportData,
-  suretyId: string
+  suretyId: string,
+  keyName: string = reportData.month
 ): Promise<string | null> {
   if (!env.S3_REPORTS_BUCKET) return null;
-  const key = `reports/${suretyId}/${reportData.month}.pdf`;
+  const key = `reports/${suretyId}/${keyName}.pdf`;
   // Production: await puppeteer render + S3 PutObjectCommand with SSE-KMS
   return key;
+}
+
+export const REPORT_URL_EXPIRES_IN_SECONDS = 900;
+
+// Stub: in production, generate a pre-signed S3 GetObject URL for `key`.
+export function presignReportUrl(key: string): string {
+  return `/dev/reports/${key}`;
 }
 
 // Stub: in production, use SendGrid/SES to email surety_admin users.

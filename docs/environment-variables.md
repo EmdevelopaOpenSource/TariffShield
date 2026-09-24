@@ -109,6 +109,7 @@ All DocuSign variables are optional. If not set, bond-signature endpoints operat
 |----------|----------|-------------|---------------|
 | `SENDGRID_API_KEY` | No | SendGrid API key for compliance report email notifications | `SG.xxxxxxx` |
 | `REPORT_FROM_EMAIL` | No | From address for compliance report notification emails | `reports@tariffshield.io` |
+| `API_PUBLIC_URL` | No (default: `http://localhost:3002`) | Externally reachable API base URL used for download links in scheduled compliance report emails | `https://api.tariffshield.io` |
 
 ---
 
