@@ -28,6 +28,7 @@ import { lookupCbpDutyRate } from '../services/cbp-duty-lookup.js';
 import { validateHtsRates } from '../services/hts-rate-validator.js';
 import { screenImporterEntity, screenWalletAddress } from '../services/aml-screening.js';
 import { validateBondForm301 } from '../services/cbp-bond-validation.js';
+import { hasActiveBrokerGrant } from './broker.js';
 import { env } from '../config/env.js';
 import { enqueueTxSubmit, txSubmitQueue } from '../queue.js';
 import {
@@ -714,6 +715,19 @@ importersRouter.post('/admin/:id/review/decision', async (req: Request, res: Res
 async function loadImporterFor(req: Request, importerId: string) {
   const user = (req as AuthedRequest).user;
   if (user.role === 'surety_admin') {
+    const r = await pool.query('SELECT * FROM importers WHERE id = $1', [importerId]);
+    return r.rows[0] ?? null;
+  }
+  // #988 — a broker gets read-only access (GET only — loadImporterFor is
+  // shared by every importer-scoped route including destructive ones like
+  // deposit/withdraw/clawback/upload-tariff-csv, and "Broker access excludes
+  // destructive admin-only actions" is an explicit AC) for any importer they
+  // hold an active (non-revoked) grant for; no grant means no access, same
+  // as any other user_id mismatch below.
+  if (user.role === 'broker') {
+    if (req.method !== 'GET') return null;
+    const granted = await hasActiveBrokerGrant(user.id, importerId);
+    if (!granted) return null;
     const r = await pool.query('SELECT * FROM importers WHERE id = $1', [importerId]);
     return r.rows[0] ?? null;
   }
