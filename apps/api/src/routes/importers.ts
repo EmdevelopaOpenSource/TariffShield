@@ -2251,7 +2251,14 @@ importersRouter.post(
 );
 
 const WithdrawSchema = z.object({
-  amountStroops: z.string().regex(/^\d+$/),
+  amountStroops: z
+    .union([z.string(), z.number()])
+    .transform((v) => String(v))
+    .refine((v) => /^\d+$/.test(v) && BigInt(v) > 0n, {
+      message: 'amountStroops must be a positive integer',
+    }),
+  targetDate: z.string().optional(),
+  targetAddress: z.string().optional(),
 });
 
 importersRouter.post('/:id/withdraw', async (req: Request, res: Response) => {
@@ -2273,13 +2280,40 @@ importersRouter.post('/:id/withdraw', async (req: Request, res: Response) => {
 
   const parse = WithdrawSchema.safeParse(req.body);
   if (!parse.success) {
-    res.status(400).json({ error: 'invalid input' });
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
     return;
   }
 
   const amlRes = await screenWalletAddress(importer.stellar_address);
   if (amlRes.riskScore === 'HIGH') {
     res.status(403).json({ error: 'Transaction blocked pending AML review' });
+    return;
+  }
+
+  // Future-dated scheduled withdrawal support (#994)
+  if (parse.data.targetDate) {
+    const targetDate = new Date(parse.data.targetDate);
+    if (isNaN(targetDate.getTime()) || targetDate.getTime() <= Date.now()) {
+      res.status(400).json({ error: 'targetDate must be a valid future timestamp' });
+      return;
+    }
+
+    const inserted = await pool.query(
+      `INSERT INTO scheduled_withdrawals (importer_id, requested_by, amount_stroops, target_date, target_address, status)
+       VALUES ($1, $2, $3, $4, $5, 'pending')
+       RETURNING id, importer_id, requested_by, amount_stroops::text AS amount_stroops,
+                 target_date, target_address, status, created_at, updated_at`,
+      [importer.id, user.id, parse.data.amountStroops, targetDate, parse.data.targetAddress ?? null]
+    );
+
+    const scheduledWithdrawal = inserted.rows[0]!;
+    await logAudit(user.id, 'withdraw_scheduled', importer.id, {
+      withdrawalId: scheduledWithdrawal.id,
+      amountStroops: parse.data.amountStroops,
+      targetDate: targetDate.toISOString(),
+    });
+
+    res.status(201).json({ status: 'scheduled', scheduledWithdrawal });
     return;
   }
 
@@ -2315,7 +2349,7 @@ importersRouter.post('/:id/withdraw', async (req: Request, res: Response) => {
     keypairSecret: importer.stellar_secret_encrypted,
     args: {
       importerAddress: importer.stellar_address,
-      sourceAddress: importer.stellar_address,
+      sourceAddress: parse.data.targetAddress || importer.stellar_address,
       amountStroops: parse.data.amountStroops,
     },
   });
@@ -2327,6 +2361,165 @@ importersRouter.post('/:id/withdraw', async (req: Request, res: Response) => {
 
   res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
 });
+
+// ── #994: Future-Dated Staged Withdrawal Scheduling for Collateral ───────────
+
+const CreateScheduledWithdrawalSchema = z.object({
+  amountStroops: z
+    .union([z.string(), z.number()])
+    .transform((v) => String(v))
+    .refine((v) => /^\d+$/.test(v) && BigInt(v) > 0n, {
+      message: 'amountStroops must be a positive integer',
+    }),
+  targetDate: z.string(),
+  targetAddress: z.string().optional(),
+});
+
+// POST /importers/:id/scheduled-withdrawals — schedule future-dated withdrawal
+importersRouter.post('/:id/scheduled-withdrawals', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  if (importer.kyc_status !== 'approved') {
+    res.status(403).json({
+      error: 'KYC approval required before withdrawals',
+      kycStatus: importer.kyc_status,
+    });
+    return;
+  }
+
+  const parse = CreateScheduledWithdrawalSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+    return;
+  }
+
+  const targetDate = new Date(parse.data.targetDate);
+  if (isNaN(targetDate.getTime()) || targetDate.getTime() <= Date.now()) {
+    res.status(400).json({ error: 'targetDate must be a valid future timestamp' });
+    return;
+  }
+
+  const amlRes = await screenWalletAddress(importer.stellar_address);
+  if (amlRes.riskScore === 'HIGH') {
+    res.status(403).json({ error: 'Transaction blocked pending AML review' });
+    return;
+  }
+
+  const inserted = await pool.query(
+    `INSERT INTO scheduled_withdrawals (importer_id, requested_by, amount_stroops, target_date, target_address, status)
+     VALUES ($1, $2, $3, $4, $5, 'pending')
+     RETURNING id, importer_id, requested_by, amount_stroops::text AS amount_stroops,
+               target_date, target_address, status, created_at, updated_at`,
+    [importer.id, user.id, parse.data.amountStroops, targetDate, parse.data.targetAddress ?? null]
+  );
+
+  const scheduledWithdrawal = inserted.rows[0]!;
+  await logAudit(user.id, 'withdraw_scheduled', importer.id, {
+    withdrawalId: scheduledWithdrawal.id,
+    amountStroops: parse.data.amountStroops,
+    targetDate: targetDate.toISOString(),
+  });
+
+  res.status(201).json({ scheduledWithdrawal });
+});
+
+// GET /importers/:id/scheduled-withdrawals — list scheduled withdrawals
+importersRouter.get('/:id/scheduled-withdrawals', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const r = await pool.query(
+    `SELECT id, importer_id, requested_by, amount_stroops::text AS amount_stroops,
+            target_date, target_address, status, execution_result, executed_at, job_id, created_at, updated_at
+     FROM scheduled_withdrawals
+     WHERE importer_id = $1
+     ORDER BY target_date ASC`,
+    [importer.id]
+  );
+
+  res.json({ scheduledWithdrawals: r.rows });
+});
+
+// GET /importers/:id/scheduled-withdrawals/:withdrawalId — get single scheduled withdrawal
+importersRouter.get('/:id/scheduled-withdrawals/:withdrawalId', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const r = await pool.query(
+    `SELECT id, importer_id, requested_by, amount_stroops::text AS amount_stroops,
+            target_date, target_address, status, execution_result, executed_at, job_id, created_at, updated_at
+     FROM scheduled_withdrawals
+     WHERE id = $1 AND importer_id = $2`,
+    [req.params.withdrawalId, importer.id]
+  );
+
+  if (!r.rowCount) {
+    res.status(404).json({ error: 'scheduled withdrawal not found' });
+    return;
+  }
+
+  res.json({ scheduledWithdrawal: r.rows[0]! });
+});
+
+// POST /importers/:id/scheduled-withdrawals/:withdrawalId/cancel & DELETE /importers/:id/scheduled-withdrawals/:withdrawalId — cancel pending scheduled withdrawal
+async function handleCancelScheduledWithdrawal(req: Request, res: Response): Promise<void> {
+  const user = (req as AuthedRequest).user;
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const existing = await pool.query(
+    `SELECT id, status, target_date FROM scheduled_withdrawals WHERE id = $1 AND importer_id = $2`,
+    [req.params.withdrawalId, importer.id]
+  );
+
+  if (!existing.rowCount) {
+    res.status(404).json({ error: 'scheduled withdrawal not found' });
+    return;
+  }
+
+  const sw = existing.rows[0]!;
+  if (sw.status !== 'pending') {
+    res.status(409).json({ error: `cannot cancel withdrawal with status ${sw.status}` });
+    return;
+  }
+
+  if (new Date(sw.target_date).getTime() <= Date.now()) {
+    res.status(400).json({ error: 'cannot cancel a scheduled withdrawal that has reached its target execution date' });
+    return;
+  }
+
+  const r = await pool.query(
+    `UPDATE scheduled_withdrawals
+     SET status = 'cancelled', execution_result = 'Cancelled by user', updated_at = now()
+     WHERE id = $1 AND importer_id = $2
+     RETURNING id, importer_id, requested_by, amount_stroops::text AS amount_stroops,
+               target_date, target_address, status, execution_result, executed_at, job_id, created_at, updated_at`,
+    [req.params.withdrawalId, importer.id]
+  );
+
+  await logAudit(user.id, 'withdraw_scheduled_cancelled', importer.id, {
+    withdrawalId: req.params.withdrawalId,
+  });
+
+  res.json({ success: true, scheduledWithdrawal: r.rows[0]! });
+}
+
+importersRouter.post('/:id/scheduled-withdrawals/:withdrawalId/cancel', handleCancelScheduledWithdrawal);
+importersRouter.delete('/:id/scheduled-withdrawals/:withdrawalId', handleCancelScheduledWithdrawal);
 
 // ── #1040: Bulk HS Code Mapping Table Import for Product Catalogs ───────────
 

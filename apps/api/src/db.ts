@@ -691,6 +691,27 @@ export async function rollback(): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_deposit_schedule_executions_importer
       ON deposit_schedule_executions(importer_id, executed_at DESC);
 
+    -- #994: future-dated staged withdrawal scheduling
+    CREATE TABLE IF NOT EXISTS scheduled_withdrawals (
+      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+      importer_id UUID NOT NULL REFERENCES importers(id) ON DELETE CASCADE,
+      requested_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      amount_stroops NUMERIC(20, 0) NOT NULL,
+      target_date TIMESTAMPTZ NOT NULL,
+      target_address TEXT,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'executed', 'blocked', 'cancelled')),
+      execution_result TEXT,
+      executed_at TIMESTAMPTZ,
+      job_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_scheduled_withdrawals_importer
+      ON scheduled_withdrawals(importer_id, target_date ASC);
+    CREATE INDEX IF NOT EXISTS idx_scheduled_withdrawals_due
+      ON scheduled_withdrawals(target_date) WHERE status = 'pending';
+
     -- Oracle price feed: durable audit trail of every set_required_collateral event.
     CREATE TABLE IF NOT EXISTS oracle_price_feed (
       id                   UUID          PRIMARY KEY DEFAULT uuid_generate_v4(),

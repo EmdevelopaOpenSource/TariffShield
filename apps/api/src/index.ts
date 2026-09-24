@@ -47,6 +47,7 @@ import { startComplianceEscalation } from './jobs/compliance-escalation.js';
 import { startScheduledComplianceReportDelivery } from './jobs/scheduled-compliance-reports.js';
 import { complianceReportLinksRouter } from './routes/compliance-report-links.js';
 import { startScheduledDepositsJob } from './jobs/scheduled-deposits.js';
+import { startScheduledWithdrawalsJob } from './jobs/scheduled-withdrawals.js';
 
 const app = express();
 app.use(httpLogger);
@@ -382,6 +383,7 @@ async function start() {
   startComplianceEscalation();
   startScheduledComplianceReportDelivery();
   startScheduledDepositsJob();
+  startScheduledWithdrawalsJob();
   app.listen(env.PORT, () => {
     logger.info(
       {
