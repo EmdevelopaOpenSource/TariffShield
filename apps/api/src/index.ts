@@ -50,6 +50,9 @@ import { suretyMarketplaceRouter, adminMarketplaceRouter } from './routes/surety
 import { startComplianceEscalation } from './jobs/compliance-escalation.js';
 import { startScheduledComplianceReportDelivery } from './jobs/scheduled-compliance-reports.js';
 import { complianceReportLinksRouter } from './routes/compliance-report-links.js';
+import { startScheduledDepositsJob } from './jobs/scheduled-deposits.js';
+import { startScheduledWithdrawalsJob } from './jobs/scheduled-withdrawals.js';
+import { apiKeysRouter } from './routes/api-keys.js';
 
 const app = express();
 app.use(httpLogger);
@@ -344,6 +347,8 @@ app.use('/compliance-report-links', complianceReportLinksRouter); // unauthentic
 app.use('/admin', adminRouter);
 app.use('/account', privacyRouter);
 app.use('/account', tosRouter);
+app.use('/account/api-keys', apiKeysRouter);
+app.use('/api/v1/account/api-keys', apiKeysRouter);
 app.use('/privacy', privacyRouter);
 app.use('/surety-license', suretyLicenseRouter);
 app.use('/notifications', notificationsRouter);
@@ -390,6 +395,8 @@ async function start() {
   startOnboardingDripScheduler();
   startComplianceEscalation();
   startScheduledComplianceReportDelivery();
+  startScheduledDepositsJob();
+  startScheduledWithdrawalsJob();
   app.listen(env.PORT, () => {
     logger.info(
       {

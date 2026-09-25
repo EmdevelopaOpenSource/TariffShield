@@ -47,10 +47,106 @@ export interface InvokeResult<T> {
   applicationOrder: number;
 }
 
+export interface TariffShieldApiOptions {
+  baseUrl: string;
+  apiKey?: string;
+  sessionToken?: string;
+}
+
+export class TariffShieldApiClient {
+  private readonly baseUrl: string;
+  public readonly apiKey?: string;
+  public readonly sessionToken?: string;
+
+  constructor(opts: TariffShieldApiOptions) {
+    this.baseUrl = opts.baseUrl.replace(/\/$/, '');
+    this.apiKey = opts.apiKey;
+    this.sessionToken = opts.sessionToken;
+  }
+
+  getHeaders(): Record<string, string> {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (this.apiKey) {
+      headers['X-Api-Key'] = this.apiKey;
+      headers['Authorization'] = `Bearer ${this.apiKey}`;
+    } else if (this.sessionToken) {
+      headers['Authorization'] = `Bearer ${this.sessionToken}`;
+    }
+    return headers;
+  }
+
+  async request<T>(path: string, init?: RequestInit): Promise<T> {
+    const url = `${this.baseUrl}${path.startsWith('/') ? path : `/${path}`}`;
+    const headers = {
+      ...this.getHeaders(),
+      ...(init?.headers as Record<string, string> | undefined),
+    };
+    const res = await fetch(url, { ...init, headers });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error((body as any).error || `Request failed with status ${res.status}`);
+    }
+    return res.json() as Promise<T>;
+  }
+
+  async getImporter(importerId: string) {
+    return this.request(`/importers/${importerId}`);
+  }
+
+  async getCollateralHistory(importerId: string) {
+    return this.request(`/importers/${importerId}/collateral-history`);
+  }
+
+  async createDepositSchedule(
+    importerId: string,
+    data: { cadence: 'weekly' | 'monthly'; amountStroops: string; bucket?: string; startDate?: string }
+  ) {
+    return this.request(`/importers/${importerId}/deposit-schedule`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async scheduleWithdrawal(
+    importerId: string,
+    data: { amountStroops: string; targetDate: string; targetAddress?: string }
+  ) {
+    return this.request(`/importers/${importerId}/scheduled-withdrawals`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async createApiKey(data: { label?: string; scopes?: string[]; rateLimitPerMin?: number; expiresInDays?: number }) {
+    return this.request('/account/api-keys', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async listApiKeys() {
+    return this.request('/account/api-keys');
+  }
+
+  async revokeApiKey(keyId: string) {
+    return this.request(`/account/api-keys/${keyId}/revoke`, {
+      method: 'POST',
+    });
+  }
+}
+
 export interface TariffShieldClientOptions {
-  rpcUrl: string;
-  contractId: string;
-  networkPassphrase: string;
+  rpcUrl?: string;
+  contractId?: string;
+  networkPassphrase?: string;
+  /** Optional: REST API endpoint URL */
+  apiUrl?: string;
+  /** Optional: API key for authenticating REST API calls (#995) */
+  apiKey?: string;
+  /** Optional: Session token for authenticating REST API calls */
+  sessionToken?: string;
   /** Optional: allow tests to override the timeout. */
   txTimeoutSeconds?: number;
   /** Optional: custom rpc.Server instance */
@@ -76,15 +172,24 @@ export class TariffShieldClient {
   private readonly networkPassphrase: string;
   private readonly txTimeoutSeconds: number;
   private readonly compatibilityPromise: Promise<void> | null;
+  public readonly api?: TariffShieldApiClient;
 
   constructor(opts: TariffShieldClientOptions) {
+    if (opts.apiUrl) {
+      this.api = new TariffShieldApiClient({
+        baseUrl: opts.apiUrl,
+        apiKey: opts.apiKey,
+        sessionToken: opts.sessionToken,
+      });
+    }
+
     this.server =
-      opts.server ?? new rpc.Server(opts.rpcUrl, { allowHttp: opts.rpcUrl.startsWith('http://') });
-    this.contract = new Contract(opts.contractId);
-    this.networkPassphrase = opts.networkPassphrase;
+      opts.server ?? (opts.rpcUrl ? new rpc.Server(opts.rpcUrl, { allowHttp: opts.rpcUrl.startsWith('http://') }) : (null as any));
+    this.contract = opts.contractId ? new Contract(opts.contractId) : (null as any);
+    this.networkPassphrase = opts.networkPassphrase ?? '';
     this.txTimeoutSeconds = opts.txTimeoutSeconds ?? 30;
 
-    if (!opts.skipCompatibilityCheck) {
+    if (!opts.skipCompatibilityCheck && this.contract) {
       const sdkVer = opts.sdkVersion ?? '0.1.0';
       this.compatibilityPromise = (async () => {
         try {

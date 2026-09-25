@@ -19,6 +19,15 @@ import {
 } from '../auth.js';
 import { requireLicenseVerified } from './surety-license.js';
 import {
+  s3KeyEncrypt,
+  s3KeyDecrypt,
+  uploadDocumentToS3,
+  generatePresignedUrl,
+  scanDocumentBuffer,
+  KYC_MAX_FILE_BYTES,
+  type VirusScanStatus,
+} from './kyc.js';
+import {
   contractClient,
   explorerTx,
   platformKeypair,
@@ -42,6 +51,7 @@ import {
   invalidateOnChainAccount,
   type OnChainAccountView,
 } from '../cache.js';
+import { computeNextRunAt } from '../services/deposit-schedules.js';
 
 export const importersRouter = Router();
 importersRouter.use(authMiddleware);
@@ -714,6 +724,12 @@ importersRouter.post('/admin/:id/review/decision', async (req: Request, res: Res
 
 async function loadImporterFor(req: Request, importerId: string) {
   const user = (req as AuthedRequest).user;
+  // If request is authenticated with an importer-scoped API key, strictly enforce importer scoping (#995)
+  if (user.apiKeyId && user.importerId) {
+    if (importerId !== user.importerId) {
+      return null;
+    }
+  }
   if (user.role === 'surety_admin') {
     const r = await pool.query('SELECT * FROM importers WHERE id = $1', [importerId]);
     return r.rows[0] ?? null;
@@ -889,6 +905,100 @@ importersRouter.get('/:id/collateral-status', async (req: Request, res: Response
     stale,
     lastUpdated: new Date(lastUpdatedSeconds * 1000).toISOString(),
     expiresAt: new Date(expiresAtSeconds * 1000).toISOString(),
+  });
+});
+
+// ── #992 / #994: Collateral history view with retained dispute evidence and scheduled withdrawals ─────
+importersRouter.get('/:id/collateral-history', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  // 1. Fetch on-chain collateral history (best-effort)
+  let history: Array<{ value: string; timestamp: string }> = [];
+  try {
+    const rawHistory = await contractClient.getCollateralHistory(importer.stellar_address);
+    history = rawHistory.map((e) => ({
+      value: e.value.toString(),
+      timestamp: new Date(Number(e.timestamp) * 1000).toISOString(),
+    }));
+  } catch (err) {
+    req.log?.warn?.({ err, importerId: importer.id }, 'on-chain collateral history fetch failed');
+  }
+
+  // 2. Fetch all disputes (open and resolved) along with retained evidence (#992)
+  const disputesRes = await pool.query(
+    `SELECT id, importer_id, old_required::text AS old_required, new_required::text AS new_required,
+            raise_tx_hash, status, raised_at, resolved_at, resolve_tx_hash
+     FROM collateral_disputes
+     WHERE importer_id = $1
+     ORDER BY raised_at DESC`,
+    [importer.id]
+  );
+
+  const disputeIds = disputesRes.rows.map((d) => d.id);
+  const evidenceByDispute = new Map<string, any[]>();
+  if (disputeIds.length > 0) {
+    try {
+      const evRes = await pool.query(
+        `SELECT id, dispute_id, importer_id, file_name, mime_type, file_size_bytes,
+                s3_key_encrypted, virus_scan_status, notes, created_at
+         FROM dispute_evidence
+         WHERE dispute_id = ANY($1::uuid[])
+         ORDER BY created_at ASC`,
+        [disputeIds]
+      );
+      for (const ev of evRes.rows) {
+        const list = evidenceByDispute.get(ev.dispute_id) ?? [];
+        list.push({
+          id: ev.id,
+          disputeId: ev.dispute_id,
+          importerId: ev.importer_id,
+          fileName: ev.file_name,
+          mimeType: ev.mime_type,
+          fileSizeBytes: ev.file_size_bytes,
+          virusScanStatus: ev.virus_scan_status,
+          notes: ev.notes,
+          createdAt: ev.created_at,
+          downloadUrl: ev.s3_key_encrypted
+            ? generatePresignedUrl(s3KeyDecrypt(ev.s3_key_encrypted))
+            : null,
+        });
+        evidenceByDispute.set(ev.dispute_id, list);
+      }
+    } catch {
+      // Table might not exist yet before migration
+    }
+  }
+
+  const disputes = disputesRes.rows.map((d) => ({
+    ...d,
+    evidence: evidenceByDispute.get(d.id) ?? [],
+  }));
+
+  // 3. Fetch scheduled withdrawals (#994)
+  let scheduledWithdrawals: any[] = [];
+  try {
+    const swRes = await pool.query(
+      `SELECT id, importer_id, requested_by, amount_stroops::text AS amount_stroops,
+              target_date, target_address, status, execution_result, executed_at, job_id, created_at
+       FROM scheduled_withdrawals
+       WHERE importer_id = $1
+       ORDER BY target_date ASC`,
+      [importer.id]
+    );
+    scheduledWithdrawals = swRes.rows;
+  } catch {
+    scheduledWithdrawals = [];
+  }
+
+  res.json({
+    importerId: importer.id,
+    history,
+    disputes,
+    scheduledWithdrawals,
   });
 });
 
@@ -1356,6 +1466,545 @@ importersRouter.post('/:id/auto-top-up', async (req: Request, res: Response) => 
   res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
 });
 
+// ── #992: Evidence Attachments on raise_dispute Submissions ───────────────────
+
+const AttachDisputeEvidenceSchema = z
+  .object({
+    disputeId: z.string().uuid().optional(),
+    notes: z.string().max(2000).optional(),
+    fileName: z.string().max(255).optional(),
+    fileBase64: z.string().min(1).optional(),
+    mimeType: z.string().regex(/^(application\/pdf|image\/(png|jpeg))$/).optional(),
+  })
+  .refine((data) => (data.notes && data.notes.trim().length > 0) || Boolean(data.fileBase64), {
+    message: 'Either notes or fileBase64 must be provided as evidence',
+  });
+
+async function handleAttachDisputeEvidence(req: Request, res: Response): Promise<void> {
+  const user = (req as AuthedRequest).user;
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const parse = AttachDisputeEvidenceSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+    return;
+  }
+
+  const targetDisputeId = req.params.disputeId || parse.data.disputeId;
+  let disputeRow: any;
+  if (targetDisputeId) {
+    const r = await pool.query(
+      'SELECT id, importer_id, status FROM collateral_disputes WHERE id = $1 AND importer_id = $2',
+      [targetDisputeId, importer.id]
+    );
+    if (!r.rowCount) {
+      res.status(404).json({ error: 'dispute not found' });
+      return;
+    }
+    disputeRow = r.rows[0]!;
+  } else {
+    const r = await pool.query(
+      `SELECT id, importer_id, status FROM collateral_disputes
+       WHERE importer_id = $1 AND status = 'open'
+       ORDER BY raised_at DESC LIMIT 1`,
+      [importer.id]
+    );
+    if (!r.rowCount) {
+      res.status(404).json({ error: 'no open dispute found for importer' });
+      return;
+    }
+    disputeRow = r.rows[0]!;
+  }
+
+  // Attempting to attach evidence after resolve_dispute is rejected (#992 AC 5)
+  if (disputeRow.status !== 'open') {
+    res.status(409).json({ error: 'dispute is already resolved; cannot attach evidence' });
+    return;
+  }
+
+  let s3KeyEncrypted: string | null = null;
+  let virusScanStatus: VirusScanStatus = 'clean';
+  let fileSizeBytes: number | null = null;
+
+  if (parse.data.fileBase64) {
+    const fileBuffer = Buffer.from(parse.data.fileBase64, 'base64');
+    if (fileBuffer.length === 0) {
+      res.status(400).json({ error: 'file is empty' });
+      return;
+    }
+    if (fileBuffer.length > KYC_MAX_FILE_BYTES) {
+      res.status(413).json({ error: `file exceeds ${KYC_MAX_FILE_BYTES} byte limit` });
+      return;
+    }
+    const mimeType = parse.data.mimeType ?? 'application/pdf';
+    virusScanStatus = scanDocumentBuffer(fileBuffer, mimeType);
+    if (virusScanStatus === 'infected') {
+      res.status(422).json({ error: 'virus detected in uploaded document' });
+      return;
+    }
+
+    const s3Key = await uploadDocumentToS3(importer.id, 'dispute_evidence', fileBuffer, mimeType);
+    s3KeyEncrypted = s3KeyEncrypt(s3Key);
+    fileSizeBytes = fileBuffer.length;
+  }
+
+  const inserted = await pool.query(
+    `INSERT INTO dispute_evidence (dispute_id, importer_id, file_name, mime_type, file_size_bytes, s3_key_encrypted, virus_scan_status, notes)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     RETURNING id, dispute_id, importer_id, file_name, mime_type, file_size_bytes, virus_scan_status, notes, created_at`,
+    [
+      disputeRow.id,
+      importer.id,
+      parse.data.fileName ?? null,
+      parse.data.mimeType ?? null,
+      fileSizeBytes,
+      s3KeyEncrypted,
+      virusScanStatus,
+      parse.data.notes ?? null,
+    ]
+  );
+
+  const evidence = inserted.rows[0]!;
+
+  await logAudit(user.id, 'dispute_evidence_attached', importer.id, {
+    disputeId: disputeRow.id,
+    evidenceId: evidence.id,
+    fileName: parse.data.fileName ?? null,
+    hasNotes: Boolean(parse.data.notes),
+  });
+
+  res.status(201).json({
+    evidence: {
+      ...evidence,
+      downloadUrl: s3KeyEncrypted ? generatePresignedUrl(s3KeyDecrypt(s3KeyEncrypted)) : null,
+    },
+  });
+}
+
+// Attach evidence to open dispute (with or without disputeId in URL)
+importersRouter.post('/:id/disputes/evidence', handleAttachDisputeEvidence);
+importersRouter.post('/:id/disputes/:disputeId/evidence', handleAttachDisputeEvidence);
+
+// List evidence for an importer's dispute
+importersRouter.get('/:id/disputes/:disputeId/evidence', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+  const disputeId = req.params.disputeId;
+  const evRes = await pool.query(
+    `SELECT id, dispute_id, importer_id, file_name, mime_type, file_size_bytes,
+            s3_key_encrypted, virus_scan_status, notes, created_at
+     FROM dispute_evidence
+     WHERE dispute_id = $1 AND importer_id = $2
+     ORDER BY created_at ASC`,
+    [disputeId, importer.id]
+  );
+  const evidence = evRes.rows.map((row) => ({
+    id: row.id,
+    disputeId: row.dispute_id,
+    importerId: row.importer_id,
+    fileName: row.file_name,
+    mimeType: row.mime_type,
+    fileSizeBytes: row.file_size_bytes,
+    virusScanStatus: row.virus_scan_status,
+    notes: row.notes,
+    createdAt: row.created_at,
+    downloadUrl: row.s3_key_encrypted
+      ? generatePresignedUrl(s3KeyDecrypt(row.s3_key_encrypted))
+      : null,
+  }));
+  res.json({ evidence });
+});
+
+importersRouter.get('/:id/disputes/evidence', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+  const openDispute = await pool.query(
+    `SELECT id FROM collateral_disputes WHERE importer_id = $1 AND status = 'open' ORDER BY raised_at DESC LIMIT 1`,
+    [importer.id]
+  );
+  if (!openDispute.rowCount) {
+    res.status(404).json({ error: 'no open dispute found' });
+    return;
+  }
+  const disputeId = openDispute.rows[0]!.id;
+  const evRes = await pool.query(
+    `SELECT id, dispute_id, importer_id, file_name, mime_type, file_size_bytes,
+            s3_key_encrypted, virus_scan_status, notes, created_at
+     FROM dispute_evidence
+     WHERE dispute_id = $1 AND importer_id = $2
+     ORDER BY created_at ASC`,
+    [disputeId, importer.id]
+  );
+  const evidence = evRes.rows.map((row) => ({
+    id: row.id,
+    disputeId: row.dispute_id,
+    importerId: row.importer_id,
+    fileName: row.file_name,
+    mimeType: row.mime_type,
+    fileSizeBytes: row.file_size_bytes,
+    virusScanStatus: row.virus_scan_status,
+    notes: row.notes,
+    createdAt: row.created_at,
+    downloadUrl: row.s3_key_encrypted
+      ? generatePresignedUrl(s3KeyDecrypt(row.s3_key_encrypted))
+      : null,
+  }));
+  res.json({ disputeId, evidence });
+});
+
+// ── #993: Recurring Collateral Deposit Scheduling ───────────────────────────
+
+const CreateDepositScheduleSchema = z.object({
+  cadence: z.enum(['weekly', 'monthly']),
+  amountStroops: z
+    .union([z.string(), z.number()])
+    .transform((v) => String(v))
+    .refine((v) => /^\d+$/.test(v) && BigInt(v) > 0n, {
+      message: 'amountStroops must be a positive integer',
+    }),
+  bucket: z.enum(['collateral', 'reserve']).default('collateral').optional(),
+  startDate: z.string().optional(),
+});
+
+const UpdateDepositScheduleSchema = z.object({
+  cadence: z.enum(['weekly', 'monthly']).optional(),
+  amountStroops: z
+    .union([z.string(), z.number()])
+    .transform((v) => String(v))
+    .refine((v) => /^\d+$/.test(v) && BigInt(v) > 0n, {
+      message: 'amountStroops must be a positive integer',
+    })
+    .optional(),
+  bucket: z.enum(['collateral', 'reserve']).optional(),
+  status: z.enum(['active', 'paused', 'cancelled']).optional(),
+});
+
+// POST /importers/:id/deposit-schedule — configure recurring deposit schedule
+importersRouter.post('/:id/deposit-schedule', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  if (importer.kyc_status !== 'approved') {
+    res.status(403).json({
+      error: 'KYC approval required before collateral deposit scheduling',
+      kycStatus: importer.kyc_status,
+    });
+    return;
+  }
+
+  const parse = CreateDepositScheduleSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+    return;
+  }
+
+  const amlRes = await screenWalletAddress(importer.stellar_address);
+  if (amlRes.riskScore === 'HIGH') {
+    res.status(403).json({ error: 'Transaction blocked pending AML review' });
+    return;
+  }
+
+  let nextRunAt: Date;
+  if (parse.data.startDate) {
+    const parsedStart = new Date(parse.data.startDate);
+    if (!isNaN(parsedStart.getTime()) && parsedStart.getTime() > Date.now()) {
+      nextRunAt = parsedStart;
+    } else {
+      nextRunAt = computeNextRunAt(parse.data.cadence, new Date());
+    }
+  } else {
+    nextRunAt = computeNextRunAt(parse.data.cadence, new Date());
+  }
+
+  const inserted = await pool.query(
+    `INSERT INTO deposit_schedules (importer_id, user_id, cadence, amount_stroops, bucket, status, next_run_at)
+     VALUES ($1, $2, $3, $4, $5, 'active', $6)
+     RETURNING id, importer_id, user_id, cadence, amount_stroops::text AS amount_stroops,
+               bucket, status, next_run_at, last_run_at, created_at, updated_at`,
+    [
+      importer.id,
+      user.id,
+      parse.data.cadence,
+      parse.data.amountStroops,
+      parse.data.bucket ?? 'collateral',
+      nextRunAt,
+    ]
+  );
+
+  const schedule = inserted.rows[0]!;
+
+  await logAudit(user.id, 'create_deposit_schedule', importer.id, {
+    scheduleId: schedule.id,
+    cadence: parse.data.cadence,
+    amountStroops: parse.data.amountStroops,
+    bucket: parse.data.bucket ?? 'collateral',
+  });
+
+  res.status(201).json({ schedule });
+});
+
+// GET /importers/:id/deposit-schedule & GET /importers/:id/deposit-schedules — list active/all schedules
+async function handleListDepositSchedules(req: Request, res: Response): Promise<void> {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const r = await pool.query(
+    `SELECT id, importer_id, user_id, cadence, amount_stroops::text AS amount_stroops,
+            bucket, status, next_run_at, last_run_at, last_error, created_at, updated_at
+     FROM deposit_schedules
+     WHERE importer_id = $1
+     ORDER BY created_at DESC`,
+    [importer.id]
+  );
+
+  res.json({ schedules: r.rows });
+}
+
+importersRouter.get('/:id/deposit-schedule', handleListDepositSchedules);
+importersRouter.get('/:id/deposit-schedules', handleListDepositSchedules);
+
+// GET /importers/:id/deposit-schedule/history & GET /importers/:id/deposit-schedules/history
+async function handleListDepositScheduleHistory(req: Request, res: Response): Promise<void> {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const r = await pool.query(
+    `SELECT id, schedule_id, importer_id, amount_stroops::text AS amount_stroops,
+            bucket, status, job_id, error_message, executed_at
+     FROM deposit_schedule_executions
+     WHERE importer_id = $1
+     ORDER BY executed_at DESC`,
+    [importer.id]
+  );
+
+  res.json({ history: r.rows });
+}
+
+importersRouter.get('/:id/deposit-schedule/history', handleListDepositScheduleHistory);
+importersRouter.get('/:id/deposit-schedules/history', handleListDepositScheduleHistory);
+
+// GET /importers/:id/deposit-schedule/:scheduleId — get single schedule
+importersRouter.get('/:id/deposit-schedule/:scheduleId', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const r = await pool.query(
+    `SELECT id, importer_id, user_id, cadence, amount_stroops::text AS amount_stroops,
+            bucket, status, next_run_at, last_run_at, last_error, created_at, updated_at
+     FROM deposit_schedules
+     WHERE id = $1 AND importer_id = $2`,
+    [req.params.scheduleId, importer.id]
+  );
+
+  if (!r.rowCount) {
+    res.status(404).json({ error: 'deposit schedule not found' });
+    return;
+  }
+
+  res.json({ schedule: r.rows[0]! });
+});
+
+// GET /importers/:id/deposit-schedule/:scheduleId/history — get history for specific schedule
+importersRouter.get('/:id/deposit-schedule/:scheduleId/history', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const r = await pool.query(
+    `SELECT id, schedule_id, importer_id, amount_stroops::text AS amount_stroops,
+            bucket, status, job_id, error_message, executed_at
+     FROM deposit_schedule_executions
+     WHERE schedule_id = $1 AND importer_id = $2
+     ORDER BY executed_at DESC`,
+    [req.params.scheduleId, importer.id]
+  );
+
+  res.json({ history: r.rows });
+});
+
+// POST /importers/:id/deposit-schedule/:scheduleId/pause — pause schedule
+importersRouter.post('/:id/deposit-schedule/:scheduleId/pause', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const r = await pool.query(
+    `UPDATE deposit_schedules
+     SET status = 'paused', updated_at = now()
+     WHERE id = $1 AND importer_id = $2
+     RETURNING id, importer_id, user_id, cadence, amount_stroops::text AS amount_stroops,
+               bucket, status, next_run_at, last_run_at, last_error, created_at, updated_at`,
+    [req.params.scheduleId, importer.id]
+  );
+
+  if (!r.rowCount) {
+    res.status(404).json({ error: 'deposit schedule not found' });
+    return;
+  }
+
+  await logAudit(user.id, 'pause_deposit_schedule', importer.id, {
+    scheduleId: req.params.scheduleId,
+  });
+
+  res.json({ schedule: r.rows[0]! });
+});
+
+// POST /importers/:id/deposit-schedule/:scheduleId/resume — resume schedule
+importersRouter.post('/:id/deposit-schedule/:scheduleId/resume', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const existing = await pool.query(
+    `SELECT id, cadence, next_run_at FROM deposit_schedules WHERE id = $1 AND importer_id = $2`,
+    [req.params.scheduleId, importer.id]
+  );
+
+  if (!existing.rowCount) {
+    res.status(404).json({ error: 'deposit schedule not found' });
+    return;
+  }
+
+  const current = existing.rows[0]!;
+  let nextRunAt = current.next_run_at;
+  if (new Date(nextRunAt).getTime() <= Date.now()) {
+    nextRunAt = computeNextRunAt(current.cadence, new Date());
+  }
+
+  const r = await pool.query(
+    `UPDATE deposit_schedules
+     SET status = 'active', next_run_at = $3, updated_at = now()
+     WHERE id = $1 AND importer_id = $2
+     RETURNING id, importer_id, user_id, cadence, amount_stroops::text AS amount_stroops,
+               bucket, status, next_run_at, last_run_at, last_error, created_at, updated_at`,
+    [req.params.scheduleId, importer.id, nextRunAt]
+  );
+
+  await logAudit(user.id, 'resume_deposit_schedule', importer.id, {
+    scheduleId: req.params.scheduleId,
+  });
+
+  res.json({ schedule: r.rows[0]! });
+});
+
+// PATCH /importers/:id/deposit-schedule/:scheduleId — edit schedule
+importersRouter.patch('/:id/deposit-schedule/:scheduleId', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const parse = UpdateDepositScheduleSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+    return;
+  }
+
+  const { cadence, amountStroops, bucket, status } = parse.data;
+  if (!cadence && !amountStroops && !bucket && !status) {
+    res.status(400).json({ error: 'no fields provided to update' });
+    return;
+  }
+
+  const existing = await pool.query(
+    `SELECT id, cadence, amount_stroops, bucket, status, next_run_at FROM deposit_schedules WHERE id = $1 AND importer_id = $2`,
+    [req.params.scheduleId, importer.id]
+  );
+
+  if (!existing.rowCount) {
+    res.status(404).json({ error: 'deposit schedule not found' });
+    return;
+  }
+
+  const cur = existing.rows[0]!;
+  const newCadence = cadence ?? cur.cadence;
+  const newAmount = amountStroops ?? cur.amount_stroops;
+  const newBucket = bucket ?? cur.bucket;
+  const newStatus = status ?? cur.status;
+
+  const r = await pool.query(
+    `UPDATE deposit_schedules
+     SET cadence = $3, amount_stroops = $4, bucket = $5, status = $6, updated_at = now()
+     WHERE id = $1 AND importer_id = $2
+     RETURNING id, importer_id, user_id, cadence, amount_stroops::text AS amount_stroops,
+               bucket, status, next_run_at, last_run_at, last_error, created_at, updated_at`,
+    [req.params.scheduleId, importer.id, newCadence, newAmount, newBucket, newStatus]
+  );
+
+  await logAudit(user.id, 'update_deposit_schedule', importer.id, {
+    scheduleId: req.params.scheduleId,
+    changes: parse.data,
+  });
+
+  res.json({ schedule: r.rows[0]! });
+});
+
+// POST /importers/:id/deposit-schedule/:scheduleId/cancel & DELETE /importers/:id/deposit-schedule/:scheduleId — cancel schedule
+async function handleCancelDepositSchedule(req: Request, res: Response): Promise<void> {
+  const user = (req as AuthedRequest).user;
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const r = await pool.query(
+    `UPDATE deposit_schedules
+     SET status = 'cancelled', updated_at = now()
+     WHERE id = $1 AND importer_id = $2
+     RETURNING id, importer_id, user_id, cadence, amount_stroops::text AS amount_stroops,
+               bucket, status, next_run_at, last_run_at, last_error, created_at, updated_at`,
+    [req.params.scheduleId, importer.id]
+  );
+
+  if (!r.rowCount) {
+    res.status(404).json({ error: 'deposit schedule not found' });
+    return;
+  }
+
+  await logAudit(user.id, 'cancel_deposit_schedule', importer.id, {
+    scheduleId: req.params.scheduleId,
+  });
+
+  res.json({ success: true, schedule: r.rows[0]! });
+}
+
+importersRouter.post('/:id/deposit-schedule/:scheduleId/cancel', handleCancelDepositSchedule);
+importersRouter.delete('/:id/deposit-schedule/:scheduleId', handleCancelDepositSchedule);
+
 // ── #1038: Dual Sign-Off Approval Configuration & Withdrawal Workflow ───────
 
 const DualApprovalConfigSchema = z.object({
@@ -1622,7 +2271,14 @@ importersRouter.post(
 );
 
 const WithdrawSchema = z.object({
-  amountStroops: z.string().regex(/^\d+$/),
+  amountStroops: z
+    .union([z.string(), z.number()])
+    .transform((v) => String(v))
+    .refine((v) => /^\d+$/.test(v) && BigInt(v) > 0n, {
+      message: 'amountStroops must be a positive integer',
+    }),
+  targetDate: z.string().optional(),
+  targetAddress: z.string().optional(),
 });
 
 importersRouter.post('/:id/withdraw', async (req: Request, res: Response) => {
@@ -1644,13 +2300,40 @@ importersRouter.post('/:id/withdraw', async (req: Request, res: Response) => {
 
   const parse = WithdrawSchema.safeParse(req.body);
   if (!parse.success) {
-    res.status(400).json({ error: 'invalid input' });
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
     return;
   }
 
   const amlRes = await screenWalletAddress(importer.stellar_address);
   if (amlRes.riskScore === 'HIGH') {
     res.status(403).json({ error: 'Transaction blocked pending AML review' });
+    return;
+  }
+
+  // Future-dated scheduled withdrawal support (#994)
+  if (parse.data.targetDate) {
+    const targetDate = new Date(parse.data.targetDate);
+    if (isNaN(targetDate.getTime()) || targetDate.getTime() <= Date.now()) {
+      res.status(400).json({ error: 'targetDate must be a valid future timestamp' });
+      return;
+    }
+
+    const inserted = await pool.query(
+      `INSERT INTO scheduled_withdrawals (importer_id, requested_by, amount_stroops, target_date, target_address, status)
+       VALUES ($1, $2, $3, $4, $5, 'pending')
+       RETURNING id, importer_id, requested_by, amount_stroops::text AS amount_stroops,
+                 target_date, target_address, status, created_at, updated_at`,
+      [importer.id, user.id, parse.data.amountStroops, targetDate, parse.data.targetAddress ?? null]
+    );
+
+    const scheduledWithdrawal = inserted.rows[0]!;
+    await logAudit(user.id, 'withdraw_scheduled', importer.id, {
+      withdrawalId: scheduledWithdrawal.id,
+      amountStroops: parse.data.amountStroops,
+      targetDate: targetDate.toISOString(),
+    });
+
+    res.status(201).json({ status: 'scheduled', scheduledWithdrawal });
     return;
   }
 
@@ -1686,7 +2369,7 @@ importersRouter.post('/:id/withdraw', async (req: Request, res: Response) => {
     keypairSecret: importer.stellar_secret_encrypted,
     args: {
       importerAddress: importer.stellar_address,
-      sourceAddress: importer.stellar_address,
+      sourceAddress: parse.data.targetAddress || importer.stellar_address,
       amountStroops: parse.data.amountStroops,
     },
   });
@@ -1698,6 +2381,165 @@ importersRouter.post('/:id/withdraw', async (req: Request, res: Response) => {
 
   res.status(202).json({ jobId, statusUrl: `/importers/${importer.id}/tx-status/${jobId}` });
 });
+
+// ── #994: Future-Dated Staged Withdrawal Scheduling for Collateral ───────────
+
+const CreateScheduledWithdrawalSchema = z.object({
+  amountStroops: z
+    .union([z.string(), z.number()])
+    .transform((v) => String(v))
+    .refine((v) => /^\d+$/.test(v) && BigInt(v) > 0n, {
+      message: 'amountStroops must be a positive integer',
+    }),
+  targetDate: z.string(),
+  targetAddress: z.string().optional(),
+});
+
+// POST /importers/:id/scheduled-withdrawals — schedule future-dated withdrawal
+importersRouter.post('/:id/scheduled-withdrawals', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  if (importer.kyc_status !== 'approved') {
+    res.status(403).json({
+      error: 'KYC approval required before withdrawals',
+      kycStatus: importer.kyc_status,
+    });
+    return;
+  }
+
+  const parse = CreateScheduledWithdrawalSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+    return;
+  }
+
+  const targetDate = new Date(parse.data.targetDate);
+  if (isNaN(targetDate.getTime()) || targetDate.getTime() <= Date.now()) {
+    res.status(400).json({ error: 'targetDate must be a valid future timestamp' });
+    return;
+  }
+
+  const amlRes = await screenWalletAddress(importer.stellar_address);
+  if (amlRes.riskScore === 'HIGH') {
+    res.status(403).json({ error: 'Transaction blocked pending AML review' });
+    return;
+  }
+
+  const inserted = await pool.query(
+    `INSERT INTO scheduled_withdrawals (importer_id, requested_by, amount_stroops, target_date, target_address, status)
+     VALUES ($1, $2, $3, $4, $5, 'pending')
+     RETURNING id, importer_id, requested_by, amount_stroops::text AS amount_stroops,
+               target_date, target_address, status, created_at, updated_at`,
+    [importer.id, user.id, parse.data.amountStroops, targetDate, parse.data.targetAddress ?? null]
+  );
+
+  const scheduledWithdrawal = inserted.rows[0]!;
+  await logAudit(user.id, 'withdraw_scheduled', importer.id, {
+    withdrawalId: scheduledWithdrawal.id,
+    amountStroops: parse.data.amountStroops,
+    targetDate: targetDate.toISOString(),
+  });
+
+  res.status(201).json({ scheduledWithdrawal });
+});
+
+// GET /importers/:id/scheduled-withdrawals — list scheduled withdrawals
+importersRouter.get('/:id/scheduled-withdrawals', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const r = await pool.query(
+    `SELECT id, importer_id, requested_by, amount_stroops::text AS amount_stroops,
+            target_date, target_address, status, execution_result, executed_at, job_id, created_at, updated_at
+     FROM scheduled_withdrawals
+     WHERE importer_id = $1
+     ORDER BY target_date ASC`,
+    [importer.id]
+  );
+
+  res.json({ scheduledWithdrawals: r.rows });
+});
+
+// GET /importers/:id/scheduled-withdrawals/:withdrawalId — get single scheduled withdrawal
+importersRouter.get('/:id/scheduled-withdrawals/:withdrawalId', async (req: Request, res: Response) => {
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const r = await pool.query(
+    `SELECT id, importer_id, requested_by, amount_stroops::text AS amount_stroops,
+            target_date, target_address, status, execution_result, executed_at, job_id, created_at, updated_at
+     FROM scheduled_withdrawals
+     WHERE id = $1 AND importer_id = $2`,
+    [req.params.withdrawalId, importer.id]
+  );
+
+  if (!r.rowCount) {
+    res.status(404).json({ error: 'scheduled withdrawal not found' });
+    return;
+  }
+
+  res.json({ scheduledWithdrawal: r.rows[0]! });
+});
+
+// POST /importers/:id/scheduled-withdrawals/:withdrawalId/cancel & DELETE /importers/:id/scheduled-withdrawals/:withdrawalId — cancel pending scheduled withdrawal
+async function handleCancelScheduledWithdrawal(req: Request, res: Response): Promise<void> {
+  const user = (req as AuthedRequest).user;
+  const importer = await loadImporterFor(req, String(req.params.id ?? ''));
+  if (!importer) {
+    res.status(404).json({ error: 'not found' });
+    return;
+  }
+
+  const existing = await pool.query(
+    `SELECT id, status, target_date FROM scheduled_withdrawals WHERE id = $1 AND importer_id = $2`,
+    [req.params.withdrawalId, importer.id]
+  );
+
+  if (!existing.rowCount) {
+    res.status(404).json({ error: 'scheduled withdrawal not found' });
+    return;
+  }
+
+  const sw = existing.rows[0]!;
+  if (sw.status !== 'pending') {
+    res.status(409).json({ error: `cannot cancel withdrawal with status ${sw.status}` });
+    return;
+  }
+
+  if (new Date(sw.target_date).getTime() <= Date.now()) {
+    res.status(400).json({ error: 'cannot cancel a scheduled withdrawal that has reached its target execution date' });
+    return;
+  }
+
+  const r = await pool.query(
+    `UPDATE scheduled_withdrawals
+     SET status = 'cancelled', execution_result = 'Cancelled by user', updated_at = now()
+     WHERE id = $1 AND importer_id = $2
+     RETURNING id, importer_id, requested_by, amount_stroops::text AS amount_stroops,
+               target_date, target_address, status, execution_result, executed_at, job_id, created_at, updated_at`,
+    [req.params.withdrawalId, importer.id]
+  );
+
+  await logAudit(user.id, 'withdraw_scheduled_cancelled', importer.id, {
+    withdrawalId: req.params.withdrawalId,
+  });
+
+  res.json({ success: true, scheduledWithdrawal: r.rows[0]! });
+}
+
+importersRouter.post('/:id/scheduled-withdrawals/:withdrawalId/cancel', handleCancelScheduledWithdrawal);
+importersRouter.delete('/:id/scheduled-withdrawals/:withdrawalId', handleCancelScheduledWithdrawal);
 
 // ── #1040: Bulk HS Code Mapping Table Import for Product Catalogs ───────────
 
